@@ -23,13 +23,13 @@ Plus 5h 81% (54m) | wk 13% (3d)
 1. Clone this repo anywhere stable.
 
 ```bash
-git clone https://github.com/5TuX/opencode-codex-usage.git ~/Documents/gdrive-shared/opencode/opencode-codex-usage
+git clone https://github.com/5TuX/opencode-codex-usage.git ~/opencode-codex-usage
 ```
 
 2. Install dependencies.
 
 ```bash
-cd ~/Documents/gdrive-shared/opencode/opencode-codex-usage
+cd ~/opencode-codex-usage
 npm install
 ```
 
@@ -41,7 +41,7 @@ Create or update `~/.config/opencode/tui.json`:
 {
   "$schema": "https://opencode.ai/tui.json",
   "plugin": [
-    "/home/YOUR_USER/Documents/gdrive-shared/opencode/opencode-codex-usage/plugins/codex-usage.tsx"
+    "/absolute/path/to/opencode-codex-usage/plugins/codex-usage.tsx"
   ]
 }
 ```
