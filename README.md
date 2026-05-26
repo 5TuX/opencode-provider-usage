@@ -56,6 +56,7 @@ Create or update `~/.config/opencode/tui.json`:
 - Registers a command: `Refresh Codex usage`.
 - Hidden for non-Codex providers (for example Copilot).
 - Provider/model visibility is decided from the currently selected model first, then recent session history as fallback.
+- Visibility is refreshed on TUI command/session changes so switching provider/model updates the badge without sending a message.
 
 ## Minimal Roadmap
 

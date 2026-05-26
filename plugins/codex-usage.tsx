@@ -228,8 +228,11 @@ function UsageBadge(props: {
 
 function createRefreshLoop(api: TuiPluginApi) {
   const [state, setState] = createSignal<UsageState>({ status: "loading" });
+  const [visibilityNonce, setVisibilityNonce] = createSignal(0);
   let disposed = false;
   let inflight = false;
+
+  const bumpVisibility = () => setVisibilityNonce((value) => value + 1);
 
   const refresh = async () => {
     if (disposed || inflight) return;
@@ -258,14 +261,21 @@ function createRefreshLoop(api: TuiPluginApi) {
     },
   ]);
 
+  const offTuiCommand = api.event.on("tui.command.execute", bumpVisibility);
+  const offSessionSelect = api.event.on("tui.session.select", bumpVisibility);
+  const offSessionUpdated = api.event.on("session.updated", bumpVisibility);
+  const offMessageUpdated = api.event.on("message.updated", bumpVisibility);
+
   api.slots.register({
     order: 90,
     slots: {
       home_prompt_right(ctx: TuiSlotContext) {
+        visibilityNonce();
         if (!shouldShowUsageForSession(api, currentSessionID(api))) return null;
         return <UsageBadge state={state()} theme={ctx.theme.current} />;
       },
       session_prompt_right(ctx: TuiSlotContext & { session_id?: string }) {
+        visibilityNonce();
         const sessionID = ctx.session_id ?? currentSessionID(api);
         if (!shouldShowUsageForSession(api, sessionID)) return null;
         return <UsageBadge state={state()} theme={ctx.theme.current} />;
@@ -276,6 +286,10 @@ function createRefreshLoop(api: TuiPluginApi) {
   api.lifecycle.onDispose(() => {
     disposed = true;
     clearInterval(interval);
+    offTuiCommand();
+    offSessionSelect();
+    offSessionUpdated();
+    offMessageUpdated();
     commandDispose();
   });
 }
