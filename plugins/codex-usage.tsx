@@ -132,6 +132,20 @@ function isCodexLikeProvider(providerID?: string, modelID?: string): boolean {
   return false;
 }
 
+function configuredProviderHint(api: TuiPluginApi): { providerID?: string; modelID?: string } {
+  const model = api.state.config.model;
+  if (typeof model !== "string" || !model.trim()) return {};
+  const value = model.trim();
+  const slash = value.indexOf("/");
+  if (slash > 0) {
+    return {
+      providerID: value.slice(0, slash),
+      modelID: value.slice(slash + 1),
+    };
+  }
+  return { modelID: value };
+}
+
 function extractProvider(message: Message): { providerID?: string; modelID?: string } {
   if (message.role === "assistant") {
     return { providerID: message.providerID, modelID: message.modelID };
@@ -143,6 +157,11 @@ function extractProvider(message: Message): { providerID?: string; modelID?: str
 }
 
 function shouldShowUsageForSession(api: TuiPluginApi, sessionID?: string): boolean {
+  const configured = configuredProviderHint(api);
+  if (configured.providerID || configured.modelID) {
+    return isCodexLikeProvider(configured.providerID, configured.modelID);
+  }
+
   if (!sessionID) return false;
   const messages = api.state.session.messages(sessionID);
   for (let i = messages.length - 1; i >= 0; i -= 1) {

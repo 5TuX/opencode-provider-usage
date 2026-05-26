@@ -53,7 +53,7 @@ Create or update `~/.config/opencode/tui.json`:
 - Reads auth from `~/.local/share/opencode/auth.json`.
 - Refreshes every 60 seconds.
 - Registers a command: `Refresh Codex usage`.
-- Badge is shown only when the active session provider/model looks OpenAI/Codex-related (hidden for providers like Copilot).
+- Badge is shown only when provider/model looks OpenAI/Codex-related (hidden for providers like Copilot), using current configured model first then session history as fallback.
 
 ## Minimal Roadmap
 
