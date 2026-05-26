@@ -10,6 +10,7 @@ It reads your existing local `opencode` OpenAI auth and fetches usage from the s
 - weekly usage
 - time until the 5h window resets
 - time until the weekly window resets
+- badge shown only when the active model/provider is OpenAI/Codex-related
 
 Example:
 
@@ -53,7 +54,8 @@ Create or update `~/.config/opencode/tui.json`:
 - Reads auth from `~/.local/share/opencode/auth.json`.
 - Refreshes every 60 seconds.
 - Registers a command: `Refresh Codex usage`.
-- Badge is shown only when provider/model looks OpenAI/Codex-related (hidden for providers like Copilot), using current configured model first then session history as fallback.
+- Hidden for non-Codex providers (for example Copilot).
+- Provider/model visibility is decided from the currently selected model first, then recent session history as fallback.
 
 ## Minimal Roadmap
 
