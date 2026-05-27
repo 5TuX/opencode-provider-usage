@@ -281,6 +281,7 @@ function currentSessionID(api: TuiPluginApi): string | undefined {
 function UsageBadge(props: {
   state: UsageState;
   theme: TuiThemeCurrent;
+  compact?: boolean;
 }) {
   return (
     <Show
@@ -300,22 +301,23 @@ function UsageBadge(props: {
         const secondaryUsed = ready.secondary?.used_percent;
         const primaryReset = formatReset(ready.primary);
         const secondaryReset = formatReset(ready.secondary);
+        const planPrefix = plan ? `[${plan}] ` : "";
         return (
           <box flexDirection="row">
-            <text fg={props.theme.textMuted}>{plan ? `${plan} - ` : ""}</text>
+            <text fg={props.theme.textMuted}>{planPrefix}</text>
             <text fg={usageColor(props.theme, primaryUsed)}>
               {typeof primaryUsed === "number" ? `${primaryLabel}: ${primaryUsed}%` : `${primaryLabel}: --`}
             </text>
-            <Show when={primaryReset}>
+            <Show when={!props.compact && primaryReset}>
               <text fg={props.theme.textMuted}>{` (-${primaryReset})`}</text>
             </Show>
             <Show when={typeof secondaryUsed === "number"}>
-              <text fg={props.theme.textMuted}>{" - "}</text>
+              <text fg={props.theme.textMuted}>{" | "}</text>
               <text fg={usageColor(props.theme, secondaryUsed)}>
                 {`${secondaryLabel}: ${secondaryUsed}%`}
               </text>
             </Show>
-            <Show when={typeof secondaryUsed === "number" && secondaryReset}>
+            <Show when={!props.compact && typeof secondaryUsed === "number" && secondaryReset}>
               <text fg={props.theme.textMuted}>{` (-${secondaryReset})`}</text>
             </Show>
           </box>
@@ -372,7 +374,7 @@ function createRefreshLoop(api: TuiPluginApi) {
       home_prompt_right(ctx: TuiSlotContext) {
         visibilityNonce();
         if (!shouldShowUsageForSession(api, currentSessionID(api))) return null;
-        return <UsageBadge state={state()} theme={ctx.theme.current} />;
+        return <UsageBadge state={state()} theme={ctx.theme.current} compact />;
       },
       session_prompt_right(ctx: TuiSlotContext & { session_id?: string }) {
         visibilityNonce();
