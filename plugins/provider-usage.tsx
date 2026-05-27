@@ -17,6 +17,7 @@ const AUTH_PATH = join(homedir(), ".local", "share", "opencode", "auth.json");
 const MODEL_STATE_PATH = join(homedir(), ".local", "state", "opencode", "model.json");
 const USAGE_URL = "https://chatgpt.com/backend-api/wham/usage";
 const COPILOT_USAGE_URL = "https://api.github.com/copilot_internal/user";
+const ANTHROPIC_MESSAGES_URL = "https://api.anthropic.com/v1/messages";
 const REFRESH_MS = 60_000;
 const VISIBILITY_REFRESH_MS = 1_000;
 const JET_PASTEL_MIX = 0.28;
@@ -67,7 +68,21 @@ type CopilotUsagePayload = {
   };
 };
 
-type ActiveProvider = "openai" | "copilot" | "other";
+type AnthropicRateLimit = {
+  requestsRemaining?: number;
+  requestsResetAt?: number;
+  inputTokensRemaining?: number;
+  outputTokensRemaining?: number;
+};
+
+type ActiveProvider = "openai" | "copilot" | "anthropic" | "other";
+
+type ProviderResolution = {
+  provider: ActiveProvider;
+  hint: ProviderHint;
+  sessionID?: string;
+  generation: number;
+};
 
 type UsageState =
   | { status: "loading" }
@@ -84,6 +99,7 @@ type UsageState =
         entitlement?: number;
         resetAt?: number;
       };
+      anthropic?: AnthropicRateLimit;
       updatedAt: number;
     }
   | { status: "error"; message: string };
@@ -127,6 +143,15 @@ function readCopilotAuth(): { access: string } {
     throw new Error("GitHub Copilot auth not found");
   }
   return { access: copilot.access };
+}
+
+function readAnthropicAuth(): { key: string } {
+  const raw = JSON.parse(readFileSync(AUTH_PATH, "utf8"));
+  const anthropic = raw?.anthropic;
+  if (!anthropic?.key) {
+    throw new Error("Anthropic auth not found");
+  }
+  return { key: anthropic.key };
 }
 
 async function fetchOpenAIUsage(): Promise<Exclude<UsageState, { status: "loading" | "error" }>> {
@@ -207,6 +232,52 @@ async function fetchCopilotUsage(): Promise<Exclude<UsageState, { status: "loadi
   };
 }
 
+function parseHeaderNumber(value: string | null): number | undefined {
+  if (!value) return undefined;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : undefined;
+}
+
+function parseHeaderTime(value: string | null): number | undefined {
+  if (!value) return undefined;
+  const parsed = Date.parse(value);
+  return Number.isNaN(parsed) ? undefined : parsed;
+}
+
+async function fetchAnthropicUsage(modelID: string): Promise<Exclude<UsageState, { status: "loading" | "error" }>> {
+  const auth = readAnthropicAuth();
+  const response = await fetch(ANTHROPIC_MESSAGES_URL, {
+    method: "POST",
+    headers: {
+      "x-api-key": auth.key,
+      "anthropic-version": "2023-06-01",
+      "content-type": "application/json",
+      "User-Agent": "opencode-provider-usage",
+    },
+    body: JSON.stringify({
+      model: modelID,
+      max_tokens: 0,
+      messages: [{ role: "user", content: "hi" }],
+    }),
+  });
+
+  if (!response.ok) {
+    throw new Error(`Anthropic usage request failed (${response.status})`);
+  }
+
+  return {
+    status: "ready",
+    provider: "anthropic",
+    anthropic: {
+      requestsRemaining: parseHeaderNumber(response.headers.get("anthropic-ratelimit-requests-remaining")),
+      requestsResetAt: parseHeaderTime(response.headers.get("anthropic-ratelimit-requests-reset")),
+      inputTokensRemaining: parseHeaderNumber(response.headers.get("anthropic-ratelimit-input-tokens-remaining")),
+      outputTokensRemaining: parseHeaderNumber(response.headers.get("anthropic-ratelimit-output-tokens-remaining")),
+    },
+    updatedAt: Date.now(),
+  };
+}
+
 function formatPlan(planType?: string): string | undefined {
   if (!planType) return undefined;
   return planType.charAt(0).toUpperCase() + planType.slice(1);
@@ -216,6 +287,22 @@ function formatAbsoluteReset(resetAt?: number): string | undefined {
   if (typeof resetAt !== "number" || Number.isNaN(resetAt)) return undefined;
   const seconds = Math.max(0, Math.ceil((resetAt - Date.now()) / 1000));
   return formatReset({ reset_after_seconds: seconds });
+}
+
+function formatCountdown(resetAt?: number): string | undefined {
+  if (typeof resetAt !== "number" || Number.isNaN(resetAt)) return undefined;
+  const totalSeconds = Math.max(0, Math.ceil((resetAt - Date.now()) / 1000));
+  if (totalSeconds <= 1) return undefined;
+  if (totalSeconds < 60) return `${totalSeconds}s`;
+
+  const days = Math.floor(totalSeconds / 86_400);
+  const hours = Math.floor((totalSeconds % 86_400) / 3_600);
+  const minutes = Math.floor((totalSeconds % 3_600) / 60);
+  const seconds = totalSeconds % 60;
+
+  if (days > 0) return hours > 0 ? `${days}d${hours}h` : `${days}d`;
+  if (hours > 0) return minutes > 0 ? `${hours}h${minutes}m` : `${hours}h`;
+  return seconds > 0 ? `${minutes}m${seconds}s` : `${minutes}m`;
 }
 
 function formatWindowLabel(window?: WindowSnapshot, fallback?: string): string {
@@ -293,6 +380,14 @@ function usageColor(theme: TuiThemeCurrent, usedPercent?: number) {
   return jetColor(usedPercent);
 }
 
+function formatCompactNumber(value?: number): string {
+  if (typeof value !== "number" || !Number.isFinite(value)) return "--";
+  if (Math.abs(value) < 1_000) return `${Math.round(value)}`;
+  if (Math.abs(value) < 10_000) return `${Math.round(value / 100) / 10}k`;
+  if (Math.abs(value) < 1_000_000) return `${Math.round(value / 1_000)}k`;
+  return `${Math.round(value / 100_000) / 10}m`;
+}
+
 function isOpenAIUsageProvider(providerID?: string, modelID?: string): boolean {
   const provider = (providerID ?? "").toLowerCase();
   const model = (modelID ?? "").toLowerCase();
@@ -308,11 +403,17 @@ function isCopilotProvider(providerID?: string, modelID?: string): boolean {
   return provider.includes("copilot") || model.includes("copilot");
 }
 
+function isAnthropicProvider(providerID?: string, modelID?: string): boolean {
+  const provider = (providerID ?? "").toLowerCase();
+  const model = (modelID ?? "").toLowerCase();
+  return provider.includes("anthropic") || model.includes("claude");
+}
+
 function isSupportedUsageProvider(providerID?: string, modelID?: string): boolean {
   const provider = (providerID ?? "").toLowerCase();
   const model = (modelID ?? "").toLowerCase();
   if (!provider && !model) return true;
-  return isOpenAIUsageProvider(provider, model) || isCopilotProvider(provider, model);
+  return isOpenAIUsageProvider(provider, model) || isCopilotProvider(provider, model) || isAnthropicProvider(provider, model);
 }
 
 function hasProviderHint(hint: ProviderHint | undefined): boolean {
@@ -379,12 +480,18 @@ function formatProviderHint(hint: ProviderHint): string {
   return `${hint.providerID ?? "?"}/${hint.modelID ?? "?"}`;
 }
 
-function currentProviderHint(api: TuiPluginApi, sessionID?: string, sessionEntrySelectedHint?: ProviderHint): ProviderHint {
-  const selected = selectedProviderHint();
+function currentProviderHint(
+  api: TuiPluginApi,
+  sessionID?: string,
+  sessionEntrySelectedHint?: ProviderHint,
+  sessionSelectionChanged?: boolean,
+): ProviderHint {
+  const selected = liveSelectedProviderHint(api);
   const session = sessionProviderHint(api, sessionID);
 
   if (hasProviderHint(session)) {
     if (!hasProviderHint(selected)) return session;
+    if (sessionSelectionChanged) return selected;
     if (!hasProviderHint(sessionEntrySelectedHint) || sameProviderHint(selected, sessionEntrySelectedHint)) {
       return session;
     }
@@ -396,15 +503,91 @@ function currentProviderHint(api: TuiPluginApi, sessionID?: string, sessionEntry
   return configuredProviderHint(api);
 }
 
-function activeProvider(api: TuiPluginApi, sessionID?: string, sessionEntrySelectedHint?: ProviderHint): ActiveProvider {
-  const current = currentProviderHint(api, sessionID, sessionEntrySelectedHint);
+function currentHomeProviderHint(
+  api: TuiPluginApi,
+  homeEntryProviderHint?: ProviderHint,
+  homeEntrySelectedHint?: ProviderHint,
+  homeSelectionChanged?: boolean,
+): ProviderHint {
+  const selected = liveSelectedProviderHint(api);
+  if (homeSelectionChanged && hasProviderHint(selected)) return selected;
+  if (hasProviderHint(selected)) return selected;
+  if (hasProviderHint(homeEntryProviderHint)) return homeEntryProviderHint;
+  return configuredProviderHint(api);
+}
+
+function activeProvider(
+  api: TuiPluginApi,
+  sessionID?: string,
+  sessionEntrySelectedHint?: ProviderHint,
+  sessionSelectionChanged?: boolean,
+  homeEntryProviderHint?: ProviderHint,
+  homeEntrySelectedHint?: ProviderHint,
+  homeSelectionChanged?: boolean,
+): ActiveProvider {
+  const current = sessionID
+    ? currentProviderHint(api, sessionID, sessionEntrySelectedHint, sessionSelectionChanged)
+    : currentHomeProviderHint(api, homeEntryProviderHint, homeEntrySelectedHint, homeSelectionChanged);
   if (current.providerID || current.modelID) {
     if (isCopilotProvider(current.providerID, current.modelID)) return "copilot";
     if (isOpenAIUsageProvider(current.providerID, current.modelID)) return "openai";
+    if (isAnthropicProvider(current.providerID, current.modelID)) return "anthropic";
     return "other";
   }
 
   return "openai";
+}
+
+async function resolveProvider(
+  api: TuiPluginApi,
+  sessionID: string | undefined,
+  sessionEntrySelectedHint: ProviderHint | undefined,
+  sessionSelectionChanged: boolean,
+  homeEntryProviderHint: ProviderHint | undefined,
+  homeEntrySelectedHint: ProviderHint | undefined,
+  homeSelectionChanged: boolean,
+): Promise<{ provider: ActiveProvider; hint: ProviderHint }> {
+  if (!sessionID) {
+    const hint = currentHomeProviderHint(api, homeEntryProviderHint, homeEntrySelectedHint, homeSelectionChanged);
+    return { provider: providerFromHint(hint), hint };
+  }
+
+  const fetchedSession = await fetchSessionProviderHint(api, sessionID);
+  const selected = liveSelectedProviderHint(api);
+  let hint: ProviderHint;
+
+  if (sessionSelectionChanged && hasProviderHint(selected)) {
+    hint = selected;
+  } else if (
+    hasProviderHint(selected) &&
+    hasProviderHint(fetchedSession) &&
+    providerFromHint(selected) !== providerFromHint(fetchedSession)
+  ) {
+    hint = selected;
+  } else if (hasProviderHint(fetchedSession)) {
+    hint = fetchedSession;
+  } else {
+    hint = currentProviderHint(api, sessionID, sessionEntrySelectedHint, sessionSelectionChanged);
+  }
+
+  return { provider: providerFromHint(hint), hint };
+}
+
+function providerFromHint(hint: ProviderHint): ActiveProvider {
+  if (hint.providerID || hint.modelID) {
+    if (isCopilotProvider(hint.providerID, hint.modelID)) return "copilot";
+    if (isOpenAIUsageProvider(hint.providerID, hint.modelID)) return "openai";
+    if (isAnthropicProvider(hint.providerID, hint.modelID)) return "anthropic";
+    return "other";
+  }
+
+  return "openai";
+}
+
+function liveSelectedProviderHint(api: TuiPluginApi): ProviderHint {
+  const selected = selectedProviderHint();
+  if (hasProviderHint(selected)) return selected;
+  return configuredProviderHint(api);
 }
 
 function selectedProviderHint(): ProviderHint {
@@ -447,8 +630,18 @@ function extractProvider(message: Message): ProviderHint {
   };
 }
 
-function shouldShowUsageForSession(api: TuiPluginApi, sessionID?: string, sessionEntrySelectedHint?: ProviderHint): boolean {
-  const current = currentProviderHint(api, sessionID, sessionEntrySelectedHint);
+function shouldShowUsageForSession(
+  api: TuiPluginApi,
+  sessionID?: string,
+  sessionEntrySelectedHint?: ProviderHint,
+  sessionSelectionChanged?: boolean,
+  homeEntryProviderHint?: ProviderHint,
+  homeEntrySelectedHint?: ProviderHint,
+  homeSelectionChanged?: boolean,
+): boolean {
+  const current = sessionID
+    ? currentProviderHint(api, sessionID, sessionEntrySelectedHint, sessionSelectionChanged)
+    : currentHomeProviderHint(api, homeEntryProviderHint, homeEntrySelectedHint, homeSelectionChanged);
   if (current.providerID || current.modelID) {
     return isSupportedUsageProvider(current.providerID, current.modelID);
   }
@@ -465,6 +658,10 @@ function stateMatchesProvider(state: UsageState, provider: ActiveProvider): bool
   return state.status === "ready" && state.provider === provider;
 }
 
+function stateMatchesResolution(state: UsageState, resolution?: ProviderResolution): boolean {
+  return !!resolution && stateMatchesProvider(state, resolution.provider);
+}
+
 function UsageBadge(props: {
   state: UsageState;
   theme: TuiThemeCurrent;
@@ -479,6 +676,26 @@ function UsageBadge(props: {
     >
       {(() => {
         const ready = props.state as Extract<UsageState, { status: "ready" }>;
+        if (ready.provider === "anthropic") {
+          const requests = `${formatCompactNumber(ready.anthropic?.requestsRemaining)} req`;
+          const input = `${formatCompactNumber(ready.anthropic?.inputTokensRemaining)} in`;
+          const output = `${formatCompactNumber(ready.anthropic?.outputTokensRemaining)} out`;
+          const reset = formatCountdown(ready.anthropic?.requestsResetAt);
+          return (
+            <box flexDirection="row">
+              <text fg={props.theme.textMuted}>[API] </text>
+              <text>{requests}</text>
+              <text fg={props.theme.textMuted}>{" | "}</text>
+              <text>{input}</text>
+              <text fg={props.theme.textMuted}>{" | "}</text>
+              <text>{output}</text>
+              <Show when={!props.compact && reset}>
+                <text fg={props.theme.textMuted}>{` (-${reset})`}</text>
+              </Show>
+            </box>
+          );
+        }
+
         if (ready.provider === "copilot") {
           const plan = ready.copilot?.plan;
           const used = ready.copilot?.usedPercent;
@@ -532,28 +749,79 @@ function UsageBadge(props: {
 
 function createRefreshLoop(api: TuiPluginApi) {
   const [state, setState] = createSignal<UsageState>({ status: "loading" });
+  const [resolution, setResolution] = createSignal<ProviderResolution | undefined>();
   const [visibilityNonce, setVisibilityNonce] = createSignal(0);
   let disposed = false;
   let inflight = false;
   let refreshQueued = false;
   let lastProvider: ActiveProvider | undefined;
   let lastSessionID: string | undefined;
+  let generation = 0;
+  let scheduleRefresh = () => {
+    refreshQueued = true;
+  };
   let sessionEntrySelectedHint: ProviderHint | undefined;
+  let sessionSelectionChanged = false;
+  let homeEntryProviderHint: ProviderHint | undefined;
+  let homeEntrySelectedHint: ProviderHint | undefined;
+  let homeSelectionChanged = false;
 
   const syncSessionContext = (sessionID?: string) => {
     const current = sessionID ?? currentSessionID(api);
     if (current !== lastSessionID) {
-      lastSessionID = current;
-      sessionEntrySelectedHint = current ? selectedProviderHint() : undefined;
+      generation += 1;
+      lastProvider = undefined;
+      setResolution(undefined);
+      setState({ status: "loading" });
+      const previousSessionID = lastSessionID;
+      const previousSessionEntrySelectedHint = sessionEntrySelectedHint;
+      if (current) {
+        lastSessionID = current;
+        sessionEntrySelectedHint = selectedProviderHint();
+        sessionSelectionChanged = false;
+        homeEntryProviderHint = undefined;
+        homeEntrySelectedHint = undefined;
+        homeSelectionChanged = false;
+      } else {
+        homeEntrySelectedHint = selectedProviderHint();
+        homeEntryProviderHint = previousSessionID
+          ? currentProviderHint(api, previousSessionID, previousSessionEntrySelectedHint, sessionSelectionChanged)
+          : undefined;
+        homeSelectionChanged = false;
+        lastSessionID = undefined;
+        sessionEntrySelectedHint = undefined;
+        sessionSelectionChanged = false;
+      }
+      scheduleRefresh();
     }
     return current;
   };
 
   const syncVisibility = () => {
+    const previousGeneration = generation;
     const sessionID = syncSessionContext();
-    const provider = activeProvider(api, sessionID, sessionEntrySelectedHint);
-    if (provider !== lastProvider) {
-      lastProvider = provider;
+    let providerChanged = generation !== previousGeneration;
+    if (sessionID) {
+      const selected = selectedProviderHint();
+      if (hasProviderHint(selected) && !sameProviderHint(selected, sessionEntrySelectedHint)) {
+        sessionEntrySelectedHint = selected;
+        sessionSelectionChanged = true;
+        providerChanged = true;
+      }
+    }
+    if (!sessionID) {
+      const selected = selectedProviderHint();
+      if (hasProviderHint(selected) && !sameProviderHint(selected, homeEntrySelectedHint)) {
+        homeEntrySelectedHint = selected;
+        homeSelectionChanged = true;
+        providerChanged = true;
+      }
+    }
+    if (providerChanged) {
+      generation += 1;
+      lastProvider = undefined;
+      setResolution(undefined);
+      setState({ status: "loading" });
       void refresh();
     }
     setVisibilityNonce((value) => value + 1);
@@ -566,30 +834,42 @@ function createRefreshLoop(api: TuiPluginApi) {
       return;
     }
     inflight = true;
+    let requestGeneration = generation;
     try {
       setState((current) => (current.status === "ready" ? current : { status: "loading" }));
       const sessionID = syncSessionContext();
-      const fetchedSession = await fetchSessionProviderHint(api, sessionID);
-      const provider = (() => {
-        if (fetchedSession.providerID || fetchedSession.modelID) {
-          const selected = selectedProviderHint();
-          if (!(selected.providerID || selected.modelID) || sameProviderHint(selected, sessionEntrySelectedHint)) {
-            if (isCopilotProvider(fetchedSession.providerID, fetchedSession.modelID)) return "copilot" as const;
-            if (isOpenAIUsageProvider(fetchedSession.providerID, fetchedSession.modelID)) return "openai" as const;
-            return "other" as const;
-          }
-        }
-        return activeProvider(api, sessionID, sessionEntrySelectedHint);
-      })();
+      requestGeneration = generation;
+      const resolved = await resolveProvider(
+        api,
+        sessionID,
+        sessionEntrySelectedHint,
+        sessionSelectionChanged,
+        homeEntryProviderHint,
+        homeEntrySelectedHint,
+        homeSelectionChanged,
+      );
+      if (requestGeneration !== generation || disposed) return;
+      const { provider, hint } = resolved;
       lastProvider = provider;
+      setResolution({ provider, hint, sessionID, generation: requestGeneration });
+      let nextState: Exclude<UsageState, { status: "loading" }>;
       if (provider === "copilot") {
-        setState(await fetchCopilotUsage());
+        nextState = await fetchCopilotUsage();
       } else if (provider === "openai") {
-        setState(await fetchOpenAIUsage());
+        nextState = await fetchOpenAIUsage();
+      } else if (provider === "anthropic") {
+        const anthropicModel = hint.modelID ?? configuredProviderHint(api).modelID;
+        if (!anthropicModel) {
+          throw new Error("Anthropic model not found");
+        }
+        nextState = await fetchAnthropicUsage(anthropicModel);
       } else {
-        setState({ status: "error", message: "Usage unavailable for active provider" });
+        nextState = { status: "error", message: "Usage unavailable for active provider" };
       }
+      if (requestGeneration !== generation || disposed) return;
+      setState(nextState);
     } catch (error) {
+      if (requestGeneration !== generation || disposed) return;
       const message = error instanceof Error ? error.message : "Unknown error";
       setState({ status: "error", message });
     } finally {
@@ -599,6 +879,12 @@ function createRefreshLoop(api: TuiPluginApi) {
         void refresh();
       }
     }
+  };
+
+  scheduleRefresh = () => {
+    setTimeout(() => {
+      if (!disposed) void refresh();
+    }, 0);
   };
 
   void refresh();
@@ -621,19 +907,25 @@ function createRefreshLoop(api: TuiPluginApi) {
       onSelect: async () => {
         const sessionID = syncSessionContext();
         const selected = selectedProviderHint();
+        const liveSelected = liveSelectedProviderHint(api);
         const stateSession = sessionProviderHint(api, sessionID);
         const fetchedSession = await fetchSessionProviderHint(api, sessionID);
-        const resolved = activeProvider(api, sessionID, sessionEntrySelectedHint);
+        const currentResolution = resolution();
         api.ui.toast({
           title: "Provider usage debug",
           duration: 10000,
           message: [
             `session=${sessionID ?? "<none>"}`,
             `selected=${formatProviderHint(selected)}`,
+            `live=${formatProviderHint(liveSelected)}`,
             `entrySelected=${formatProviderHint(sessionEntrySelectedHint ?? {})}`,
+            `homeEntry=${formatProviderHint(homeEntryProviderHint ?? {})}`,
+            `sessionSelectionChanged=${sessionSelectionChanged}`,
+            `homeSelectionChanged=${homeSelectionChanged}`,
             `stateSession=${formatProviderHint(stateSession)}`,
             `fetchedSession=${formatProviderHint(fetchedSession)}`,
-            `resolved=${resolved}`,
+            `resolved=${currentResolution?.provider ?? "<none>"}`,
+            `state=${state().status === "ready" ? state().provider : state().status}`,
           ].join(" | "),
         });
       },
@@ -651,17 +943,37 @@ function createRefreshLoop(api: TuiPluginApi) {
       home_prompt_right(ctx: TuiSlotContext) {
         visibilityNonce();
         const sessionID = syncSessionContext();
-        const provider = activeProvider(api, sessionID, sessionEntrySelectedHint);
-        if (!shouldShowUsageForSession(api, sessionID, sessionEntrySelectedHint)) return null;
-        if (!stateMatchesProvider(state(), provider)) return null;
+        if (
+          !shouldShowUsageForSession(
+            api,
+            sessionID,
+            sessionEntrySelectedHint,
+            sessionSelectionChanged,
+            homeEntryProviderHint,
+            homeEntrySelectedHint,
+            homeSelectionChanged,
+          )
+        )
+          return null;
+        if (!stateMatchesResolution(state(), resolution())) return null;
         return <UsageBadge state={state()} theme={ctx.theme.current} compact />;
       },
       session_prompt_right(ctx: TuiSlotContext & { session_id?: string }) {
         visibilityNonce();
         const sessionID = syncSessionContext(ctx.session_id);
-        const provider = activeProvider(api, sessionID, sessionEntrySelectedHint);
-        if (!shouldShowUsageForSession(api, sessionID, sessionEntrySelectedHint)) return null;
-        if (!stateMatchesProvider(state(), provider)) return null;
+        if (
+          !shouldShowUsageForSession(
+            api,
+            sessionID,
+            sessionEntrySelectedHint,
+            sessionSelectionChanged,
+            homeEntryProviderHint,
+            homeEntrySelectedHint,
+            homeSelectionChanged,
+          )
+        )
+          return null;
+        if (!stateMatchesResolution(state(), resolution())) return null;
         return <UsageBadge state={state()} theme={ctx.theme.current} />;
       },
     },
