@@ -289,8 +289,8 @@ function UsageBadge(props: {
         const primaryReset = formatReset(ready.primary);
         const secondaryReset = formatReset(ready.secondary);
         return (
-          <box>
-            <text fg={props.theme.textMuted}>{plan ? `${plan} ` : ""}</text>
+          <box flexDirection="row">
+            <text fg={props.theme.textMuted}>{plan ? `${plan} – ` : ""}</text>
             <text fg={usageColor(props.theme, primaryUsed)}>
               {typeof primaryUsed === "number" ? `${primaryLabel} ${primaryUsed}%` : `${primaryLabel} --`}
             </text>
