@@ -8,6 +8,7 @@ It reads your existing local `opencode` auth and shows a provider-aware badge fo
 
 - OpenAI: 5h and 7d ChatGPT usage windows, with reset timers
 - GitHub Copilot: monthly premium interaction usage, with reset timer
+- Anthropic: request and token rate-limit headroom, with request reset countdown when available
 - Other providers: badge hidden
 
 ## What It Shows
@@ -19,6 +20,9 @@ It reads your existing local `opencode` auth and shows a provider-aware badge fo
 - time until the OpenAI 7d window resets
 - Copilot monthly usage
 - time until the Copilot monthly reset
+- Anthropic remaining requests
+- Anthropic remaining input tokens
+- Anthropic remaining output tokens
 - percent values colored with a readable pastel Jet colormap, from blue at low usage to red near the limit
 
 Example:
@@ -26,6 +30,7 @@ Example:
 ```text
 [Plus] 5h: 81% (-54m) | 7d: 13% (-3d)
 [Pro] mo: 22% (-19d)
+[API] 49 req | 50k in | 10k out (-12s)
 ```
 
 ## Install
@@ -64,9 +69,9 @@ Create or update `~/.config/opencode/tui.json`:
 - Reads auth from `~/.local/share/opencode/auth.json`.
 - Reads current model selection from `~/.local/state/opencode/model.json` when available.
 - Refreshes every 60 seconds.
-- Registers commands: `Refresh provider usage`, `Debug provider usage`.
 - Hidden for unsupported providers.
-- In chat, a resumed session's provider takes precedence until you explicitly switch models afterward.
+- In chat, the badge follows the active session's own model history; switching to another session does not reuse the most recently selected model from a different session.
+- An explicit model switch inside the current session takes precedence immediately.
 - Visibility is refreshed every second and on TUI command/session changes so switching provider/model updates the badge without sending a message.
 
 ## Synced Device Workflow

@@ -427,10 +427,15 @@ function sameProviderHint(left: ProviderHint | undefined, right: ProviderHint | 
 function sessionProviderHint(api: TuiPluginApi, sessionID?: string): ProviderHint {
   if (sessionID) {
     const messages = api.state.session.messages(sessionID);
+    let fallback: ProviderHint = {};
     for (let i = messages.length - 1; i >= 0; i -= 1) {
-      const current = extractProvider(messages[i]);
-      if (current.providerID || current.modelID) return current;
+      const message = messages[i];
+      const current = extractProvider(message);
+      if (!hasProviderHint(current)) continue;
+      if (message?.role === "user") return current;
+      if (!hasProviderHint(fallback)) fallback = current;
     }
+    return fallback;
   }
 
   return {};
@@ -464,20 +469,20 @@ async function fetchSessionProviderHint(api: TuiPluginApi, sessionID?: string): 
   try {
     const response = await messagesApi({ sessionID, limit: 8 });
     const records = response?.data ?? [];
+    let fallback: ProviderHint = {};
     for (let i = records.length - 1; i >= 0; i -= 1) {
-      const current = extractProvider(records[i]?.info as Message);
-      if (current.providerID || current.modelID) return current;
+      const message = records[i]?.info as Message | undefined;
+      const current = extractProvider(message);
+      if (!hasProviderHint(current)) continue;
+      if (message?.role === "user") return current;
+      if (!hasProviderHint(fallback)) fallback = current;
     }
+    if (hasProviderHint(fallback)) return fallback;
   } catch {
     // Fall back to in-memory state if the SDK call is unavailable or fails.
   }
 
   return sessionProviderHint(api, sessionID);
-}
-
-function formatProviderHint(hint: ProviderHint): string {
-  if (!hint.providerID && !hint.modelID) return "<none>";
-  return `${hint.providerID ?? "?"}/${hint.modelID ?? "?"}`;
 }
 
 function currentProviderHint(
@@ -486,18 +491,11 @@ function currentProviderHint(
   sessionEntrySelectedHint?: ProviderHint,
   sessionSelectionChanged?: boolean,
 ): ProviderHint {
-  const selected = liveSelectedProviderHint(api);
+  const selected = selectedProviderHint();
   const session = sessionProviderHint(api, sessionID);
 
-  if (hasProviderHint(session)) {
-    if (!hasProviderHint(selected)) return session;
-    if (sessionSelectionChanged) return selected;
-    if (!hasProviderHint(sessionEntrySelectedHint) || sameProviderHint(selected, sessionEntrySelectedHint)) {
-      return session;
-    }
-    return selected;
-  }
-
+  if (sessionSelectionChanged && hasProviderHint(selected)) return selected;
+  if (hasProviderHint(session)) return session;
   if (hasProviderHint(selected)) return selected;
 
   return configuredProviderHint(api);
@@ -509,33 +507,13 @@ function currentHomeProviderHint(
   homeEntrySelectedHint?: ProviderHint,
   homeSelectionChanged?: boolean,
 ): ProviderHint {
-  const selected = liveSelectedProviderHint(api);
+  const selected = selectedProviderHint();
+  const configured = configuredProviderHint(api);
   if (homeSelectionChanged && hasProviderHint(selected)) return selected;
-  if (hasProviderHint(selected)) return selected;
+  if (hasProviderHint(configured)) return configured;
   if (hasProviderHint(homeEntryProviderHint)) return homeEntryProviderHint;
+  if (hasProviderHint(selected)) return selected;
   return configuredProviderHint(api);
-}
-
-function activeProvider(
-  api: TuiPluginApi,
-  sessionID?: string,
-  sessionEntrySelectedHint?: ProviderHint,
-  sessionSelectionChanged?: boolean,
-  homeEntryProviderHint?: ProviderHint,
-  homeEntrySelectedHint?: ProviderHint,
-  homeSelectionChanged?: boolean,
-): ActiveProvider {
-  const current = sessionID
-    ? currentProviderHint(api, sessionID, sessionEntrySelectedHint, sessionSelectionChanged)
-    : currentHomeProviderHint(api, homeEntryProviderHint, homeEntrySelectedHint, homeSelectionChanged);
-  if (current.providerID || current.modelID) {
-    if (isCopilotProvider(current.providerID, current.modelID)) return "copilot";
-    if (isOpenAIUsageProvider(current.providerID, current.modelID)) return "openai";
-    if (isAnthropicProvider(current.providerID, current.modelID)) return "anthropic";
-    return "other";
-  }
-
-  return "openai";
 }
 
 async function resolveProvider(
@@ -553,7 +531,7 @@ async function resolveProvider(
   }
 
   const fetchedSession = await fetchSessionProviderHint(api, sessionID);
-  const selected = liveSelectedProviderHint(api);
+  const selected = selectedProviderHint();
   let hint: ProviderHint;
 
   if (sessionSelectionChanged && hasProviderHint(selected)) {
@@ -576,12 +554,6 @@ function providerFromHint(hint: ProviderHint): ActiveProvider {
   }
 
   return "openai";
-}
-
-function liveSelectedProviderHint(api: TuiPluginApi): ProviderHint {
-  const configured = configuredProviderHint(api);
-  if (hasProviderHint(configured)) return configured;
-  return selectedProviderHint();
 }
 
 function selectedProviderHint(): ProviderHint {
@@ -614,7 +586,8 @@ function configuredProviderHint(api: TuiPluginApi): ProviderHint {
   return { modelID: value };
 }
 
-function extractProvider(message: Message): ProviderHint {
+function extractProvider(message?: Message): ProviderHint {
+  if (!message) return {};
   if (message.role === "assistant") {
     return { providerID: message.providerID, modelID: message.modelID };
   }
@@ -748,7 +721,6 @@ function createRefreshLoop(api: TuiPluginApi) {
   let disposed = false;
   let inflight = false;
   let refreshQueued = false;
-  let lastProvider: ActiveProvider | undefined;
   let lastSessionID: string | undefined;
   let generation = 0;
   let scheduleRefresh = () => {
@@ -764,7 +736,6 @@ function createRefreshLoop(api: TuiPluginApi) {
     const current = sessionID ?? currentSessionID(api);
     if (current !== lastSessionID) {
       generation += 1;
-      lastProvider = undefined;
       setResolution(undefined);
       setState({ status: "loading" });
       const previousSessionID = lastSessionID;
@@ -813,7 +784,6 @@ function createRefreshLoop(api: TuiPluginApi) {
     }
     if (providerChanged) {
       generation += 1;
-      lastProvider = undefined;
       setResolution(undefined);
       setState({ status: "loading" });
       void refresh();
@@ -844,7 +814,6 @@ function createRefreshLoop(api: TuiPluginApi) {
       );
       if (requestGeneration !== generation || disposed) return;
       const { provider, hint } = resolved;
-      lastProvider = provider;
       setResolution({ provider, hint, sessionID, generation: requestGeneration });
       let nextState: Exclude<UsageState, { status: "loading" }>;
       if (provider === "copilot") {
@@ -885,46 +854,7 @@ function createRefreshLoop(api: TuiPluginApi) {
   const interval = setInterval(() => void refresh(), REFRESH_MS);
   const visibilityInterval = setInterval(syncVisibility, VISIBILITY_REFRESH_MS);
 
-  const commandDispose = api.command.register(() => [
-    {
-      title: "Refresh provider usage",
-      value: "provider-usage-refresh",
-      description: "Refresh provider usage badge",
-      category: "Plugins",
-      onSelect: () => void refresh(),
-    },
-    {
-      title: "Debug provider usage",
-      value: "provider-usage-debug",
-      description: "Show current provider hints",
-      category: "Plugins",
-      onSelect: async () => {
-        const sessionID = syncSessionContext();
-        const selected = selectedProviderHint();
-        const liveSelected = liveSelectedProviderHint(api);
-        const stateSession = sessionProviderHint(api, sessionID);
-        const fetchedSession = await fetchSessionProviderHint(api, sessionID);
-        const currentResolution = resolution();
-        api.ui.toast({
-          title: "Provider usage debug",
-          duration: 10000,
-          message: [
-            `session=${sessionID ?? "<none>"}`,
-            `selected=${formatProviderHint(selected)}`,
-            `live=${formatProviderHint(liveSelected)}`,
-            `entrySelected=${formatProviderHint(sessionEntrySelectedHint ?? {})}`,
-            `homeEntry=${formatProviderHint(homeEntryProviderHint ?? {})}`,
-            `sessionSelectionChanged=${sessionSelectionChanged}`,
-            `homeSelectionChanged=${homeSelectionChanged}`,
-            `stateSession=${formatProviderHint(stateSession)}`,
-            `fetchedSession=${formatProviderHint(fetchedSession)}`,
-            `resolved=${currentResolution?.provider ?? "<none>"}`,
-            `state=${state().status === "ready" ? state().provider : state().status}`,
-          ].join(" | "),
-        });
-      },
-    },
-  ]);
+  const commandDispose = api.command.register(() => []);
 
   const offTuiCommand = api.event.on("tui.command.execute", syncVisibility);
   const offSessionSelect = api.event.on("tui.session.select", syncVisibility);
