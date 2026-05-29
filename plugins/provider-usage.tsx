@@ -18,9 +18,56 @@ const MODEL_STATE_PATH = join(homedir(), ".local", "state", "opencode", "model.j
 const USAGE_URL = "https://chatgpt.com/backend-api/wham/usage";
 const COPILOT_USAGE_URL = "https://api.github.com/copilot_internal/user";
 const ANTHROPIC_MESSAGES_URL = "https://api.anthropic.com/v1/messages";
-const REFRESH_MS = 60_000;
+const ZEN_MODELS_URL = "https://opencode.ai/zen/v1/models";
+const REFRESH_MS = 10_000;
 const VISIBILITY_REFRESH_MS = 1_000;
 const JET_PASTEL_MIX = 0.28;
+
+const ZEN_FALLBACK_MODEL_COSTS: Record<string, ZenModelCost> = {
+  "big-pickle": { input: 0, output: 0 },
+  "claude-3-5-haiku": { input: 0, output: 0 },
+  "claude-haiku-4-5": { input: 1, output: 5 },
+  "claude-opus-4-1": { input: 15, output: 75 },
+  "claude-opus-4-5": { input: 5, output: 25 },
+  "claude-opus-4-6": { input: 5, output: 25 },
+  "claude-opus-4-7": { input: 5, output: 25 },
+  "claude-opus-4-8": { input: 5, output: 25 },
+  "claude-sonnet-4": { input: 3, output: 15 },
+  "claude-sonnet-4-5": { input: 3, output: 15 },
+  "claude-sonnet-4-6": { input: 3, output: 15 },
+  "deepseek-v4-flash-free": { input: 0, output: 0 },
+  "gemini-3-flash": { input: 0.5, output: 3 },
+  "gemini-3.1-pro": { input: 2, output: 12 },
+  "gemini-3.5-flash": { input: 1.5, output: 9 },
+  "glm-5": { input: 1, output: 3.2 },
+  "glm-5.1": { input: 1.4, output: 4.4 },
+  "gpt-5": { input: 1.07, output: 8.5 },
+  "gpt-5-codex": { input: 1.07, output: 8.5 },
+  "gpt-5-nano": { input: 0.05, output: 0.4 },
+  "gpt-5.1": { input: 1.07, output: 8.5 },
+  "gpt-5.1-codex": { input: 1.07, output: 8.5 },
+  "gpt-5.1-codex-max": { input: 1.25, output: 10 },
+  "gpt-5.1-codex-mini": { input: 0.25, output: 2 },
+  "gpt-5.2": { input: 1.75, output: 14 },
+  "gpt-5.2-codex": { input: 1.75, output: 14 },
+  "gpt-5.3-codex": { input: 1.75, output: 14 },
+  "gpt-5.3-codex-spark": { input: 1.75, output: 14 },
+  "gpt-5.4": { input: 2.5, output: 15 },
+  "gpt-5.4-mini": { input: 0.75, output: 4.5 },
+  "gpt-5.4-nano": { input: 0.2, output: 1.25 },
+  "gpt-5.4-pro": { input: 30, output: 180 },
+  "gpt-5.5": { input: 5, output: 30 },
+  "gpt-5.5-pro": { input: 30, output: 180 },
+  "grok-build-0.1": { input: 1, output: 2 },
+  "kimi-k2.5": { input: 0.6, output: 3 },
+  "kimi-k2.6": { input: 0.95, output: 4 },
+  "minimax-m2.5": { input: 0.3, output: 1.2 },
+  "minimax-m2.7": { input: 0.3, output: 1.2 },
+  "mimo-v2.5-free": { input: 0, output: 0 },
+  "nemotron-3-super-free": { input: 0, output: 0 },
+  "qwen3.5-plus": { input: 0.2, output: 1.2 },
+  "qwen3.6-plus": { input: 0.5, output: 3 },
+};
 
 type Rgb = [number, number, number];
 
@@ -75,13 +122,40 @@ type AnthropicRateLimit = {
   outputTokensRemaining?: number;
 };
 
-type ActiveProvider = "openai" | "copilot" | "anthropic" | "other";
+type ZenModelCost = {
+  input?: number;
+  output?: number;
+};
+
+type SessionUsageSnapshot = {
+  cost?: number;
+  tokens?: number;
+  approximate?: boolean;
+};
+
+type ZenPriceResult = {
+  cost?: ZenModelCost;
+  fallback?: boolean;
+};
+
+type ZenModelsPayload = {
+  data?: Array<{
+    id?: string;
+    cost?: {
+      input?: number;
+      output?: number;
+    };
+  }>;
+};
+
+type ActiveProvider = "openai" | "copilot" | "anthropic" | "zen" | "other";
 
 type ProviderResolution = {
   provider: ActiveProvider;
   hint: ProviderHint;
   sessionID?: string;
   generation: number;
+  key: string;
 };
 
 type UsageState =
@@ -100,12 +174,28 @@ type UsageState =
         resetAt?: number;
       };
       anthropic?: AnthropicRateLimit;
+      zen?: {
+        price?: ZenModelCost;
+        priceFallback?: boolean;
+        session?: SessionUsageSnapshot;
+      };
       updatedAt: number;
     }
   | { status: "error"; message: string };
 
 type SessionMessageRecord = {
   info?: Message;
+};
+
+type LiveSessionUsageProvider = {
+  matches: (providerID?: string, modelID?: string) => boolean;
+  exactSessionUsage: (api: TuiPluginApi, sessionID?: string) => SessionUsageSnapshot | undefined;
+  estimateTokens: (text: string) => number;
+  outputPrice: (state: Extract<UsageState, { status: "ready" }>) => number | undefined;
+  applyEstimate: (
+    state: Extract<UsageState, { status: "ready" }>,
+    estimate: SessionUsageSnapshot,
+  ) => Extract<UsageState, { status: "ready" }>;
 };
 
 function decodeBase64Url(value: string): string {
@@ -152,6 +242,15 @@ function readAnthropicAuth(): { key: string } {
     throw new Error("Anthropic auth not found");
   }
   return { key: anthropic.key };
+}
+
+function readZenAuth(): { key: string } {
+  const raw = JSON.parse(readFileSync(AUTH_PATH, "utf8"));
+  const opencode = raw?.opencode;
+  if (!opencode?.key) {
+    throw new Error("OpenCode Zen auth not found");
+  }
+  return { key: opencode.key };
 }
 
 async function fetchOpenAIUsage(): Promise<Exclude<UsageState, { status: "loading" | "error" }>> {
@@ -244,6 +343,14 @@ function parseHeaderTime(value: string | null): number | undefined {
   return Number.isNaN(parsed) ? undefined : parsed;
 }
 
+function normalizeZenModelID(modelID?: string): string {
+  return (modelID ?? "").toLowerCase().replace(/^opencode\//, "");
+}
+
+function hasZenModelCost(cost?: ZenModelCost): cost is ZenModelCost {
+  return typeof cost?.input === "number" && typeof cost?.output === "number";
+}
+
 async function fetchAnthropicUsage(modelID: string): Promise<Exclude<UsageState, { status: "loading" | "error" }>> {
   const auth = readAnthropicAuth();
   const response = await fetch(ANTHROPIC_MESSAGES_URL, {
@@ -273,6 +380,91 @@ async function fetchAnthropicUsage(modelID: string): Promise<Exclude<UsageState,
       requestsResetAt: parseHeaderTime(response.headers.get("anthropic-ratelimit-requests-reset")),
       inputTokensRemaining: parseHeaderNumber(response.headers.get("anthropic-ratelimit-input-tokens-remaining")),
       outputTokensRemaining: parseHeaderNumber(response.headers.get("anthropic-ratelimit-output-tokens-remaining")),
+    },
+    updatedAt: Date.now(),
+  };
+}
+
+async function fetchZenModelCost(modelID?: string): Promise<ZenPriceResult | undefined> {
+  if (!modelID) return undefined;
+  const normalizedModelID = normalizeZenModelID(modelID);
+  const fallback = ZEN_FALLBACK_MODEL_COSTS[normalizedModelID];
+  const auth = readZenAuth();
+  const response = await fetch(ZEN_MODELS_URL, {
+    headers: {
+      Authorization: `Bearer ${auth.key}`,
+      "User-Agent": "opencode-provider-usage",
+    },
+  });
+
+  if (!response.ok) {
+    throw new Error(`OpenCode Zen models request failed (${response.status})`);
+  }
+
+  const payload = (await response.json()) as ZenModelsPayload;
+  const model = payload.data?.find((item) => normalizeZenModelID(item.id) === normalizedModelID);
+  if (hasZenModelCost(model?.cost)) {
+    return { cost: model.cost, fallback: false };
+  }
+  return fallback ? { cost: fallback, fallback: true } : undefined;
+}
+
+function sessionZenUsage(api: TuiPluginApi, sessionID?: string): SessionUsageSnapshot | undefined {
+  if (!sessionID) return undefined;
+  const messages = api.state.session.messages(sessionID) as Array<
+    Message & {
+      cost?: number;
+      tokens?: {
+        total?: number;
+      };
+    }
+  >;
+  let cost = 0;
+  let tokens = 0;
+  let found = false;
+
+  for (const message of messages) {
+    if (!isOpenCodeZenProvider(message.providerID, message.modelID)) continue;
+    found = true;
+    if (typeof message.cost === "number" && Number.isFinite(message.cost)) cost += message.cost;
+    if (typeof message.tokens?.total === "number" && Number.isFinite(message.tokens.total)) tokens += message.tokens.total;
+  }
+
+  return found ? { cost, tokens } : undefined;
+}
+
+function estimateTokensFromText(text: string): number {
+  if (!text) return 0;
+  return Math.ceil(text.length / 4);
+}
+
+function addLiveEstimate(base: SessionUsageSnapshot | undefined, tokens: number, outputPrice?: number): SessionUsageSnapshot {
+  const baseTokens = typeof base?.tokens === "number" && Number.isFinite(base.tokens) ? base.tokens : 0;
+  const baseCost = typeof base?.cost === "number" && Number.isFinite(base.cost) ? base.cost : undefined;
+  const estimatedCost = typeof outputPrice === "number" && Number.isFinite(outputPrice) ? (tokens * outputPrice) / 1_000_000 : undefined;
+  return {
+    tokens: baseTokens + tokens,
+    cost:
+      typeof baseCost === "number" || typeof estimatedCost === "number"
+        ? (baseCost ?? 0) + (estimatedCost ?? 0)
+        : undefined,
+    approximate: true,
+  };
+}
+
+async function fetchZenUsage(
+  api: TuiPluginApi,
+  modelID: string | undefined,
+  sessionID?: string,
+): Promise<Exclude<UsageState, { status: "loading" | "error" }>> {
+  const price = await fetchZenModelCost(modelID);
+  return {
+    status: "ready",
+    provider: "zen",
+    zen: {
+      price: price?.cost,
+      priceFallback: price?.fallback,
+      session: sessionZenUsage(api, sessionID),
     },
     updatedAt: Date.now(),
   };
@@ -388,6 +580,12 @@ function formatCompactNumber(value?: number): string {
   return `${Math.round(value / 100_000) / 10}m`;
 }
 
+function formatMoney(value?: number): string {
+  if (typeof value !== "number" || !Number.isFinite(value)) return "--";
+  if (value === 0) return "$0";
+  return `$${Math.round(value * 100) / 100}`;
+}
+
 function isOpenAIUsageProvider(providerID?: string, modelID?: string): boolean {
   const provider = (providerID ?? "").toLowerCase();
   const model = (modelID ?? "").toLowerCase();
@@ -409,11 +607,78 @@ function isAnthropicProvider(providerID?: string, modelID?: string): boolean {
   return provider.includes("anthropic") || model.includes("claude");
 }
 
+function isOpenCodeGoProvider(providerID?: string, modelID?: string): boolean {
+  const provider = (providerID ?? "").toLowerCase();
+  const model = (modelID ?? "").toLowerCase();
+  return provider === "opencode-go" || model === "go" || model.startsWith("go-") || model.includes("opencode-go");
+}
+
+function isKnownZenModelID(modelID?: string): boolean {
+  const model = normalizeZenModelID(modelID);
+  if (!model) return false;
+  return (
+    model === "claude-3-5-haiku" ||
+    model.startsWith("gpt-") ||
+    model.startsWith("claude-") ||
+    model.startsWith("gemini-") ||
+    model.startsWith("qwen") ||
+    model.startsWith("minimax-") ||
+    model.startsWith("glm-") ||
+    model.startsWith("kimi-") ||
+    model.startsWith("grok-") ||
+    model.startsWith("deepseek-") ||
+    model.startsWith("mimo-") ||
+    model.startsWith("nemotron-") ||
+    model === "big-pickle"
+  );
+}
+
+function isOpenCodeZenProvider(providerID?: string, modelID?: string): boolean {
+  const provider = (providerID ?? "").toLowerCase();
+  const model = (modelID ?? "").toLowerCase();
+  if (!model || isOpenCodeGoProvider(provider, model)) return false;
+  return (provider === "opencode" || model.startsWith("opencode/")) && isKnownZenModelID(model);
+}
+
 function isSupportedUsageProvider(providerID?: string, modelID?: string): boolean {
   const provider = (providerID ?? "").toLowerCase();
   const model = (modelID ?? "").toLowerCase();
   if (!provider && !model) return true;
-  return isOpenAIUsageProvider(provider, model) || isCopilotProvider(provider, model) || isAnthropicProvider(provider, model);
+  return (
+    isOpenAIUsageProvider(provider, model) ||
+    isCopilotProvider(provider, model) ||
+    isAnthropicProvider(provider, model) ||
+    isOpenCodeZenProvider(provider, model)
+  );
+}
+
+const LIVE_SESSION_USAGE_PROVIDERS: LiveSessionUsageProvider[] = [
+  {
+    matches: isOpenCodeZenProvider,
+    exactSessionUsage: sessionZenUsage,
+    estimateTokens: estimateTokensFromText,
+    outputPrice: (state) => state.zen?.price?.output,
+    applyEstimate: (state, session) => ({
+      ...state,
+      zen: {
+        ...state.zen,
+        session,
+      },
+      updatedAt: Date.now(),
+    }),
+  },
+];
+
+function liveSessionUsageProviderForHint(hint: ProviderHint): LiveSessionUsageProvider | undefined {
+  return LIVE_SESSION_USAGE_PROVIDERS.find((provider) => provider.matches(hint.providerID, hint.modelID));
+}
+
+function providerResolutionKey(provider: ActiveProvider, hint: ProviderHint, sessionID?: string): string {
+  const providerID = (hint.providerID ?? "").toLowerCase();
+  const modelID = isOpenCodeZenProvider(hint.providerID, hint.modelID)
+    ? normalizeZenModelID(hint.modelID)
+    : (hint.modelID ?? "").toLowerCase();
+  return `${sessionID ?? ""}|${provider}|${providerID}|${modelID}`;
 }
 
 function hasProviderHint(hint: ProviderHint | undefined): boolean {
@@ -547,6 +812,7 @@ async function resolveProvider(
 
 function providerFromHint(hint: ProviderHint): ActiveProvider {
   if (hint.providerID || hint.modelID) {
+    if (isOpenCodeZenProvider(hint.providerID, hint.modelID)) return "zen";
     if (isCopilotProvider(hint.providerID, hint.modelID)) return "copilot";
     if (isOpenAIUsageProvider(hint.providerID, hint.modelID)) return "openai";
     if (isAnthropicProvider(hint.providerID, hint.modelID)) return "anthropic";
@@ -621,12 +887,12 @@ function currentSessionID(api: TuiPluginApi): string | undefined {
   return undefined;
 }
 
-function stateMatchesProvider(state: UsageState, provider: ActiveProvider): boolean {
-  return state.status === "ready" && state.provider === provider;
-}
-
-function stateMatchesResolution(state: UsageState, resolution: ProviderResolution | undefined, sessionID?: string): boolean {
-  return !!resolution && resolution.sessionID === sessionID && stateMatchesProvider(state, resolution.provider);
+function stateMatchesResolution(
+  state: UsageState,
+  resolution: ProviderResolution | undefined,
+  key: string,
+): boolean {
+  return state.status === "ready" && !!resolution && resolution.key === key && state.provider === resolution.provider;
 }
 
 function UsageBadge(props: {
@@ -676,6 +942,23 @@ function UsageBadge(props: {
               </text>
               <Show when={!props.compact && reset}>
                 <text fg={props.theme.textMuted}>{` (-${reset})`}</text>
+              </Show>
+            </box>
+          );
+        }
+
+        if (ready.provider === "zen") {
+          const input = formatMoney(ready.zen?.price?.input);
+          const output = formatMoney(ready.zen?.price?.output);
+          const cost = formatMoney(ready.zen?.session?.cost);
+          const tokens = formatCompactNumber(ready.zen?.session?.tokens);
+          const approximate = ready.zen?.session?.approximate ? "~" : "";
+          const session = props.compact ? "" : ` | sess: ${approximate}${cost}/${tokens}t`;
+          return (
+            <box flexDirection="column">
+              <text>{`[Zen] ${input}/${output} per M${session}`}</text>
+              <Show when={!props.compact && ready.zen?.priceFallback}>
+                <text fg={props.theme.textMuted}>* bundled fallback pricing</text>
               </Show>
             </box>
           );
@@ -731,11 +1014,86 @@ function createRefreshLoop(api: TuiPluginApi) {
   let homeEntryProviderHint: ProviderHint | undefined;
   let homeEntrySelectedHint: ProviderHint | undefined;
   let homeSelectionChanged = false;
+  let liveSessionKey: string | undefined;
+  let liveSessionID: string | undefined;
+  let liveMessageID: string | undefined;
+  let liveText = "";
+  let liveBaseUsage: SessionUsageSnapshot | undefined;
+  let liveApplyTimer: ReturnType<typeof setTimeout> | undefined;
+
+  const clearLiveEstimate = () => {
+    liveSessionKey = undefined;
+    liveSessionID = undefined;
+    liveMessageID = undefined;
+    liveText = "";
+    liveBaseUsage = undefined;
+    if (liveApplyTimer) {
+      clearTimeout(liveApplyTimer);
+      liveApplyTimer = undefined;
+    }
+  };
+
+  const activeLiveContext = (sessionID?: string) => {
+    if (!sessionID || sessionID !== currentSessionID(api)) return undefined;
+    const hint = currentProviderHint(api, sessionID, sessionEntrySelectedHint, sessionSelectionChanged);
+    const capability = liveSessionUsageProviderForHint(hint);
+    if (!capability) return undefined;
+    const provider = providerFromHint(hint);
+    const key = providerResolutionKey(provider, hint, sessionID);
+    const currentState = state();
+    if (!stateMatchesResolution(currentState, resolution(), key)) return undefined;
+    if (currentState.status !== "ready") return undefined;
+    return { capability, key, state: currentState };
+  };
+
+  const applyLiveEstimate = () => {
+    liveApplyTimer = undefined;
+    const context = activeLiveContext(liveSessionID);
+    if (!context || !liveText) return;
+    const tokens = context.capability.estimateTokens(liveText);
+    const session = addLiveEstimate(liveBaseUsage, tokens, context.capability.outputPrice(context.state));
+    setState(context.capability.applyEstimate(context.state, session));
+    setVisibilityNonce((value) => value + 1);
+  };
+
+  const scheduleLiveEstimate = () => {
+    if (liveApplyTimer) return;
+    liveApplyTimer = setTimeout(applyLiveEstimate, 500);
+  };
+
+  const handleMessagePartDelta = (event: {
+    properties: { sessionID: string; messageID: string; field: string; delta: string };
+  }) => {
+    const { sessionID, messageID, field, delta } = event.properties;
+    if (!delta || (field !== "text" && field !== "content")) return;
+    const context = activeLiveContext(sessionID);
+    if (!context) return;
+    if (liveSessionKey !== context.key || liveMessageID !== messageID) {
+      liveSessionKey = context.key;
+      liveSessionID = sessionID;
+      liveMessageID = messageID;
+      liveText = "";
+      liveBaseUsage = context.capability.exactSessionUsage(api, sessionID);
+    }
+    liveText += delta;
+    scheduleLiveEstimate();
+  };
+
+  const handleMessageUpdated = (event: { properties: { sessionID: string; info: Message } }) => {
+    syncVisibility();
+    const { sessionID, info } = event.properties;
+    if (sessionID !== currentSessionID(api) || info.role !== "assistant") return;
+    if (info.time.completed) {
+      clearLiveEstimate();
+      void refresh();
+    }
+  };
 
   const syncSessionContext = (sessionID?: string) => {
     const current = sessionID ?? currentSessionID(api);
     if (current !== lastSessionID) {
       generation += 1;
+      clearLiveEstimate();
       setResolution(undefined);
       setState({ status: "loading" });
       const previousSessionID = lastSessionID;
@@ -782,8 +1140,16 @@ function createRefreshLoop(api: TuiPluginApi) {
         providerChanged = true;
       }
     }
+    const visibleHint = sessionID
+      ? currentProviderHint(api, sessionID, sessionEntrySelectedHint, sessionSelectionChanged)
+      : currentHomeProviderHint(api, homeEntryProviderHint, homeEntrySelectedHint, homeSelectionChanged);
+    const visibleKey = providerResolutionKey(providerFromHint(visibleHint), visibleHint, sessionID);
+    if (resolution()?.key && resolution()?.key !== visibleKey) {
+      providerChanged = true;
+    }
     if (providerChanged) {
       generation += 1;
+      clearLiveEstimate();
       setResolution(undefined);
       setState({ status: "loading" });
       void refresh();
@@ -800,7 +1166,6 @@ function createRefreshLoop(api: TuiPluginApi) {
     inflight = true;
     let requestGeneration = generation;
     try {
-      setState((current) => (current.status === "ready" ? current : { status: "loading" }));
       const sessionID = syncSessionContext();
       requestGeneration = generation;
       const resolved = await resolveProvider(
@@ -814,7 +1179,17 @@ function createRefreshLoop(api: TuiPluginApi) {
       );
       if (requestGeneration !== generation || disposed) return;
       const { provider, hint } = resolved;
-      setResolution({ provider, hint, sessionID, generation: requestGeneration });
+      const key = providerResolutionKey(provider, hint, sessionID);
+      if (resolution()?.key !== key) {
+        setState({ status: "loading" });
+      }
+      setResolution({
+        provider,
+        hint,
+        sessionID,
+        generation: requestGeneration,
+        key,
+      });
       let nextState: Exclude<UsageState, { status: "loading" }>;
       if (provider === "copilot") {
         nextState = await fetchCopilotUsage();
@@ -826,6 +1201,12 @@ function createRefreshLoop(api: TuiPluginApi) {
           throw new Error("Anthropic model not found");
         }
         nextState = await fetchAnthropicUsage(anthropicModel);
+      } else if (provider === "zen") {
+        const zenModel = hint.modelID ?? configuredProviderHint(api).modelID;
+        if (!zenModel) {
+          throw new Error("OpenCode Zen model not found");
+        }
+        nextState = await fetchZenUsage(api, zenModel, sessionID);
       } else {
         nextState = { status: "error", message: "Usage unavailable for active provider" };
       }
@@ -859,7 +1240,9 @@ function createRefreshLoop(api: TuiPluginApi) {
   const offTuiCommand = api.event.on("tui.command.execute", syncVisibility);
   const offSessionSelect = api.event.on("tui.session.select", syncVisibility);
   const offSessionUpdated = api.event.on("session.updated", syncVisibility);
-  const offMessageUpdated = api.event.on("message.updated", syncVisibility);
+  const offMessageUpdated = api.event.on("message.updated", handleMessageUpdated);
+  const offMessagePartDelta = api.event.on("message.part.delta", handleMessagePartDelta);
+  const offMessagePartUpdated = api.event.on("message.part.updated", syncVisibility);
 
   api.slots.register({
     order: 90,
@@ -867,6 +1250,7 @@ function createRefreshLoop(api: TuiPluginApi) {
       home_prompt_right(ctx: TuiSlotContext) {
         visibilityNonce();
         const sessionID = syncSessionContext();
+        const hint = currentHomeProviderHint(api, homeEntryProviderHint, homeEntrySelectedHint, homeSelectionChanged);
         if (
           !shouldShowUsageForSession(
             api,
@@ -879,12 +1263,14 @@ function createRefreshLoop(api: TuiPluginApi) {
           )
         )
           return null;
-        if (!stateMatchesResolution(state(), resolution(), sessionID)) return null;
+        if (!stateMatchesResolution(state(), resolution(), providerResolutionKey(providerFromHint(hint), hint, sessionID)))
+          return null;
         return <UsageBadge state={state()} theme={ctx.theme.current} compact />;
       },
       session_prompt_right(ctx: TuiSlotContext & { session_id?: string }) {
         visibilityNonce();
         const sessionID = syncSessionContext(ctx.session_id);
+        const hint = currentProviderHint(api, sessionID, sessionEntrySelectedHint, sessionSelectionChanged);
         if (
           !shouldShowUsageForSession(
             api,
@@ -897,7 +1283,8 @@ function createRefreshLoop(api: TuiPluginApi) {
           )
         )
           return null;
-        if (!stateMatchesResolution(state(), resolution(), sessionID)) return null;
+        if (!stateMatchesResolution(state(), resolution(), providerResolutionKey(providerFromHint(hint), hint, sessionID)))
+          return null;
         return <UsageBadge state={state()} theme={ctx.theme.current} />;
       },
     },
@@ -905,12 +1292,15 @@ function createRefreshLoop(api: TuiPluginApi) {
 
   api.lifecycle.onDispose(() => {
     disposed = true;
+    clearLiveEstimate();
     clearInterval(interval);
     clearInterval(visibilityInterval);
     offTuiCommand();
     offSessionSelect();
     offSessionUpdated();
     offMessageUpdated();
+    offMessagePartDelta();
+    offMessagePartUpdated();
     commandDispose();
   });
 }
