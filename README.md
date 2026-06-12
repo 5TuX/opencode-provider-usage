@@ -79,7 +79,7 @@ Create or update `~/.config/opencode/tui.json`:
 For the shared multi-device setup, edit this repo copy of the plugin:
 
 ```text
-~/Documents/gdrive-shared/opencode/opencode-provider-usage/plugins/provider-usage.tsx
+~/Documents/gdrive-shared/projets-ia/opencode-plugins/opencode-provider-usage/plugins/provider-usage.tsx
 ```
 
 Each device should keep `~/.config/opencode/plugins/` as a real local directory and link or copy the plugin file into it. The local `tui.json` should load the local file, not the synced repo path directly:
@@ -102,5 +102,5 @@ After editing the repo file:
 Linux symlink example:
 
 ```bash
-ln -sfn ~/Documents/gdrive-shared/opencode/opencode-provider-usage/plugins/provider-usage.tsx ~/.config/opencode/plugins/provider-usage.tsx
+ln -sfn ~/Documents/gdrive-shared/projets-ia/opencode-plugins/opencode-provider-usage/plugins/provider-usage.tsx ~/.config/opencode/plugins/provider-usage.tsx
 ```
