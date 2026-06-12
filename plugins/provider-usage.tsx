@@ -106,6 +106,8 @@ type CodexAccount = {
   accountId?: string;
   accessToken?: string;
   enabled?: boolean;
+  email?: string;
+  lastUsed?: number;
 };
 
 type CodexAccountStorage = {
@@ -124,6 +126,13 @@ type CodexQuotaSnapshot = {
     usedPercent?: number;
     resetAtMs?: number;
   }>;
+};
+
+type OpenAIAuth = {
+  access: string;
+  accountId: string;
+  accountIndex?: number;
+  accountCount?: number;
 };
 
 type CopilotQuotaSnapshot = {
@@ -191,7 +200,8 @@ type UsageState =
       status: "ready";
       provider: ActiveProvider;
       planType?: string;
-      accountEmail?: string;
+      accountIndex?: number;
+      accountCount?: number;
       primary?: WindowSnapshot;
       secondary?: WindowSnapshot;
       copilot?: {
@@ -272,23 +282,78 @@ function readCodexQuotaSnapshot(): CodexQuotaSnapshot | undefined {
   return raw && typeof raw === "object" ? (raw as CodexQuotaSnapshot) : undefined;
 }
 
-function readCodexOpenAIAuth(): { access: string; accountId: string; email?: string } | undefined {
+function resolveCodexModelFamily(modelID?: string): string | undefined {
+  const model = (modelID ?? "").trim().toLowerCase();
+  if (!model) return undefined;
+  if (model.includes("codex-max")) return "codex-max";
+  if (model === "gpt-5-codex") return "gpt-5-codex";
+  if (model.startsWith("gpt-5.4-pro")) return "gpt-5.4-pro";
+  if (model.startsWith("gpt-5.4-mini")) return "gpt-5.4-mini";
+  if (model.startsWith("gpt-5.4") || model.startsWith("gpt-5.5") || model.startsWith("gpt-5.4-nano")) return "gpt-5.4";
+  if (model.startsWith("gpt-5.2")) return "gpt-5.2";
+  if (model.startsWith("gpt-5.1")) return "gpt-5.1";
+  if (model.includes("codex")) return "codex";
+  return undefined;
+}
+
+function findEnabledCodexAccount(storage: CodexAccountStorage, index: number | undefined): { account: CodexAccount; index: number } | undefined {
+  const accounts = storage.accounts ?? [];
+  if (typeof index !== "number" || !Number.isFinite(index)) return undefined;
+  const resolvedIndex = Math.max(0, Math.min(accounts.length - 1, Math.trunc(index)));
+  const account = accounts[resolvedIndex];
+  return account && account.enabled !== false && account.accessToken ? { account, index: resolvedIndex } : undefined;
+}
+
+function findCodexAccountFromQuotaSnapshot(storage: CodexAccountStorage, snapshot?: CodexQuotaSnapshot): { account: CodexAccount; index: number } | undefined {
+  const email = snapshot?.accountEmail?.trim().toLowerCase();
+  if (!email) return undefined;
+  const accounts = storage.accounts ?? [];
+  for (let index = 0; index < accounts.length; index += 1) {
+    const account = accounts[index];
+    if (!account || account.enabled === false || !account.accessToken) continue;
+    if ((account.email ?? "").trim().toLowerCase() === email) return { account, index };
+  }
+  return undefined;
+}
+
+function findMostRecentlyUsedCodexAccount(storage: CodexAccountStorage): { account: CodexAccount; index: number } | undefined {
+  const accounts = storage.accounts ?? [];
+  let best: { account: CodexAccount; index: number; lastUsed: number } | undefined;
+  for (let index = 0; index < accounts.length; index += 1) {
+    const account = accounts[index];
+    if (!account || account.enabled === false || !account.accessToken) continue;
+    const lastUsed = typeof account.lastUsed === "number" && Number.isFinite(account.lastUsed) ? account.lastUsed : -1;
+    if (!best || lastUsed > best.lastUsed) best = { account, index, lastUsed };
+  }
+  return best ? { account: best.account, index: best.index } : undefined;
+}
+
+function readCodexOpenAIAuth(modelID?: string): OpenAIAuth | undefined {
   const storage = readCodexAccounts();
   const accounts = storage?.accounts ?? [];
   if (accounts.length === 0) return undefined;
-  const rawIndex = storage?.activeIndexByFamily?.codex ?? storage?.activeIndex ?? 0;
-  const activeIndex = Number.isFinite(rawIndex) ? Math.max(0, Math.min(accounts.length - 1, Math.trunc(rawIndex))) : 0;
-  const activeAccount = accounts[activeIndex];
-  const account = activeAccount?.enabled !== false ? activeAccount : accounts.find((candidate) => candidate?.enabled !== false);
+  const family = resolveCodexModelFamily(modelID);
+  const snapshot = readCodexQuotaSnapshot();
+  const selected =
+    (family ? findEnabledCodexAccount(storage!, storage?.activeIndexByFamily?.[family]) : undefined) ??
+    findCodexAccountFromQuotaSnapshot(storage!, snapshot) ??
+    findMostRecentlyUsedCodexAccount(storage!) ??
+    findEnabledCodexAccount(storage!, storage?.activeIndex);
+  const account = selected?.account;
   const access = account?.accessToken;
   if (!access) return undefined;
   const accountId = account.accountId ?? extractChatGptAccountId(access);
   if (!accountId) return undefined;
-  return { access, accountId, email: extractJwtEmail(access) };
+  return {
+    access,
+    accountId,
+    accountIndex: selected?.index,
+    accountCount: accounts.length,
+  };
 }
 
-function readOpenAIAuth(): { access: string; accountId: string; email?: string } {
-  const codexAuth = readCodexOpenAIAuth();
+function readOpenAIAuth(modelID?: string): OpenAIAuth {
+  const codexAuth = readCodexOpenAIAuth(modelID);
   if (codexAuth) return codexAuth;
 
   const raw = JSON.parse(readFileSync(AUTH_PATH, "utf8"));
@@ -302,7 +367,7 @@ function readOpenAIAuth(): { access: string; accountId: string; email?: string }
     throw new Error("ChatGPT account id not found in token");
   }
 
-  return { access: openai.access, accountId, email: extractJwtEmail(openai.access) };
+  return { access: openai.access, accountId, accountIndex: 0, accountCount: 1 };
 }
 
 function readCopilotAuth(): { access: string } {
@@ -365,8 +430,8 @@ function readZenAuth(): { key: string } {
   throw new Error("OpenCode Zen auth not found");
 }
 
-async function fetchOpenAIUsage(): Promise<Exclude<UsageState, { status: "loading" | "error" }>> {
-  const auth = readOpenAIAuth();
+async function fetchOpenAIUsage(modelID?: string): Promise<Exclude<UsageState, { status: "loading" | "error" }>> {
+  const auth = readOpenAIAuth(modelID);
   const response = await fetch(USAGE_URL, {
     headers: {
       Authorization: `Bearer ${auth.access}`,
@@ -384,7 +449,8 @@ async function fetchOpenAIUsage(): Promise<Exclude<UsageState, { status: "loadin
     status: "ready",
     provider: "openai",
     planType: payload.plan_type,
-    accountEmail: auth.email,
+    accountIndex: auth.accountIndex,
+    accountCount: auth.accountCount,
     primary: payload.rate_limit?.primary_window,
     secondary: payload.rate_limit?.secondary_window,
     updatedAt: Date.now(),
@@ -594,18 +660,19 @@ function formatPlan(planType?: string): string | undefined {
   return planType.charAt(0).toUpperCase() + planType.slice(1);
 }
 
-function formatOpenAIAccount(planType?: string, email?: string): string | undefined {
+function formatOpenAIAccount(planType?: string, accountIndex?: number, accountCount?: number): string | undefined {
   const plan = formatPlan(planType);
-  const trimmedEmail = email?.trim();
-  if (trimmedEmail && plan) return `[${trimmedEmail} ${plan}] `;
-  if (trimmedEmail) return `[${trimmedEmail}] `;
-  return plan ? `[${plan}] ` : undefined;
+  if (!plan) return undefined;
+  if (typeof accountIndex === "number" && Number.isFinite(accountIndex) && typeof accountCount === "number" && Number.isFinite(accountCount) && accountCount > 0) {
+    return `[${plan} ${accountIndex + 1}/${accountCount}] `;
+  }
+  return `[${plan}] `;
 }
 
 function formatCodexQuotaDetails(snapshot?: CodexQuotaSnapshot): string {
   if (!snapshot?.limits?.length) return "Quota details unavailable. Run a Codex request first or open codex-limits.";
   const lines: string[] = [];
-  const account = formatOpenAIAccount(snapshot.planType, snapshot.accountEmail) ?? snapshot.accountLabel;
+  const account = snapshot.accountLabel?.trim();
   if (account) lines.push(`Account: ${account.trim()}`);
   for (const limit of snapshot.limits) {
     if (!limit?.label) continue;
@@ -616,12 +683,8 @@ function formatCodexQuotaDetails(snapshot?: CodexQuotaSnapshot): string {
   return lines.join("\n");
 }
 
-function hasOpenAICodexAccountEmail(state: Extract<UsageState, { status: "ready" }>): string | undefined {
-  return state.accountEmail?.trim();
-}
-
 function formatOpenAIPrefix(state: Extract<UsageState, { status: "ready" }>): string | undefined {
-  return formatOpenAIAccount(state.planType, hasOpenAICodexAccountEmail(state));
+  return formatOpenAIAccount(state.planType, state.accountIndex, state.accountCount);
 }
 
 function formatAbsoluteReset(resetAt?: number): string | undefined {
@@ -1367,7 +1430,7 @@ function createRefreshLoop(api: TuiPluginApi) {
       if (provider === "copilot") {
         nextState = await fetchCopilotUsage();
       } else if (provider === "openai") {
-        nextState = await fetchOpenAIUsage();
+        nextState = await fetchOpenAIUsage(hint.modelID ?? configuredProviderHint(api).modelID);
       } else if (provider === "anthropic") {
         const anthropicModel = hint.modelID ?? configuredProviderHint(api).modelID;
         if (!anthropicModel) {
