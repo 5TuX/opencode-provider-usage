@@ -15,6 +15,7 @@ import { createSignal, Show } from "solid-js";
 const PLUGIN_ID = "provider-usage";
 const AUTH_PATH = join(homedir(), ".local", "share", "opencode", "auth.json");
 const CODEX_ACCOUNTS_PATH = join(homedir(), ".opencode", "oc-codex-multi-auth-accounts.json");
+const CODEX_TUI_QUOTA_PATH = join(homedir(), ".local", "state", "opencode", "oc-codex-multi-auth-tui-quota.json");
 const SECRETS_ENV_PATH = join(homedir(), ".config", "opencode", "secrets.env");
 const MODEL_STATE_PATH = join(homedir(), ".local", "state", "opencode", "model.json");
 const USAGE_URL = "https://chatgpt.com/backend-api/wham/usage";
@@ -111,6 +112,18 @@ type CodexAccountStorage = {
   accounts?: CodexAccount[];
   activeIndex?: number;
   activeIndexByFamily?: Record<string, number>;
+};
+
+type CodexQuotaSnapshot = {
+  accountEmail?: string;
+  accountLabel?: string;
+  planType?: string;
+  limits?: Array<{
+    label?: string;
+    leftPercent?: number | null;
+    usedPercent?: number;
+    resetAtMs?: number;
+  }>;
 };
 
 type CopilotQuotaSnapshot = {
@@ -251,6 +264,12 @@ function hasGlobalCodexAccounts(): boolean {
   } catch {
     return false;
   }
+}
+
+function readCodexQuotaSnapshot(): CodexQuotaSnapshot | undefined {
+  if (!existsSync(CODEX_TUI_QUOTA_PATH)) return undefined;
+  const raw = JSON.parse(readFileSync(CODEX_TUI_QUOTA_PATH, "utf8"));
+  return raw && typeof raw === "object" ? (raw as CodexQuotaSnapshot) : undefined;
 }
 
 function readCodexOpenAIAuth(): { access: string; accountId: string; email?: string } | undefined {
@@ -578,9 +597,31 @@ function formatPlan(planType?: string): string | undefined {
 function formatOpenAIAccount(planType?: string, email?: string): string | undefined {
   const plan = formatPlan(planType);
   const trimmedEmail = email?.trim();
-  if (trimmedEmail && plan) return `[${trimmedEmail} ${plan}]`;
-  if (trimmedEmail) return `[${trimmedEmail}]`;
-  return plan ? `[${plan}]` : undefined;
+  if (trimmedEmail && plan) return `[${trimmedEmail} ${plan}] `;
+  if (trimmedEmail) return `[${trimmedEmail}] `;
+  return plan ? `[${plan}] ` : undefined;
+}
+
+function formatCodexQuotaDetails(snapshot?: CodexQuotaSnapshot): string {
+  if (!snapshot?.limits?.length) return "Quota details unavailable. Run a Codex request first or open codex-limits.";
+  const lines: string[] = [];
+  const account = formatOpenAIAccount(snapshot.planType, snapshot.accountEmail) ?? snapshot.accountLabel;
+  if (account) lines.push(`Account: ${account.trim()}`);
+  for (const limit of snapshot.limits) {
+    if (!limit?.label) continue;
+    const used = typeof limit.usedPercent === "number" ? `${limit.usedPercent}% used` : "-- used";
+    const reset = formatAbsoluteReset(limit.resetAtMs);
+    lines.push(`${limit.label}: ${used}${reset ? ` (${reset})` : ""}`);
+  }
+  return lines.join("\n");
+}
+
+function hasOpenAICodexAccountEmail(state: Extract<UsageState, { status: "ready" }>): string | undefined {
+  return state.accountEmail?.trim();
+}
+
+function formatOpenAIPrefix(state: Extract<UsageState, { status: "ready" }>): string | undefined {
+  return formatOpenAIAccount(state.planType, hasOpenAICodexAccountEmail(state));
 }
 
 function formatAbsoluteReset(resetAt?: number): string | undefined {
@@ -984,10 +1025,9 @@ function shouldShowUsageForSession(
     ? currentProviderHint(api, sessionID, sessionEntrySelectedHint, sessionSelectionChanged)
     : currentHomeProviderHint(api, homeEntryProviderHint, homeEntrySelectedHint, homeSelectionChanged);
   if (current.providerID || current.modelID) {
-    if (isOpenAIUsageProvider(current.providerID, current.modelID) && hasGlobalCodexAccounts()) return false;
     return isSupportedUsageProvider(current.providerID, current.modelID);
   }
-  return !hasGlobalCodexAccounts();
+  return true;
 }
 
 function currentSessionID(api: TuiPluginApi): string | undefined {
@@ -1096,7 +1136,7 @@ function UsageBadge(props: {
           );
         }
 
-        const account = formatOpenAIAccount(ready.planType, ready.accountEmail);
+        const account = formatOpenAIPrefix(ready);
         const primaryLabel = formatWindowLabel(ready.primary, "5h");
         const secondaryLabel = formatWindowLabel(ready.secondary, "7d");
         const primaryUsed = ready.primary?.used_percent;
@@ -1106,19 +1146,18 @@ function UsageBadge(props: {
         return (
           <box flexDirection="row">
             <Show when={account}>
-              <text fg={props.theme.success}>{account}</text>
-              <text fg={props.theme.textMuted}>{" · "}</text>
+              <text fg={props.theme.textMuted}>{account}</text>
             </Show>
             <text fg={usageColor(props.theme, primaryUsed)}>
-              {typeof primaryUsed === "number" ? `${primaryLabel} ${primaryUsed}%` : `${primaryLabel} --`}
+              {typeof primaryUsed === "number" ? `${primaryLabel}: ${primaryUsed}%` : `${primaryLabel}: --`}
             </text>
             <Show when={!props.compact && primaryReset}>
               <text fg={props.theme.textMuted}>{` (-${primaryReset})`}</text>
             </Show>
             <Show when={typeof secondaryUsed === "number"}>
-              <text fg={props.theme.textMuted}>{" · "}</text>
+              <text fg={props.theme.textMuted}>{" | "}</text>
               <text fg={usageColor(props.theme, secondaryUsed)}>
-                {`${secondaryLabel} ${secondaryUsed}%`}
+                {`${secondaryLabel}: ${secondaryUsed}%`}
               </text>
             </Show>
             <Show when={!props.compact && typeof secondaryUsed === "number" && secondaryReset}>
@@ -1369,7 +1408,22 @@ function createRefreshLoop(api: TuiPluginApi) {
   const interval = setInterval(() => void refresh(), REFRESH_MS);
   const visibilityInterval = setInterval(syncVisibility, VISIBILITY_REFRESH_MS);
 
-  const commandDispose = api.command.register(() => []);
+  const commandDispose = api.command.register(() => [
+    {
+      title: "Codex quota details",
+      value: "codex.quota.details.local",
+      description: "Show active Codex quota details from the shared local cache.",
+      category: "Codex",
+      onSelect: () =>
+        api.ui.dialog.replace(() =>
+          api.ui.DialogAlert({
+            title: "Codex quota",
+            message: formatCodexQuotaDetails(readCodexQuotaSnapshot()),
+            onConfirm: () => api.ui.dialog.clear(),
+          }),
+        ),
+    },
+  ]);
 
   const offTuiCommand = api.event.on("tui.command.execute", syncVisibility);
   const offSessionSelect = api.event.on("tui.session.select", syncVisibility);
