@@ -6,7 +6,7 @@ import type {
   TuiSlotContext,
   TuiThemeCurrent,
 } from "@opencode-ai/plugin/tui";
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { createRoot } from "solid-js";
@@ -14,6 +14,7 @@ import { createSignal, Show } from "solid-js";
 
 const PLUGIN_ID = "provider-usage";
 const AUTH_PATH = join(homedir(), ".local", "share", "opencode", "auth.json");
+const CODEX_ACCOUNTS_PATH = join(homedir(), ".opencode", "oc-codex-multi-auth-accounts.json");
 const SECRETS_ENV_PATH = join(homedir(), ".config", "opencode", "secrets.env");
 const MODEL_STATE_PATH = join(homedir(), ".local", "state", "opencode", "model.json");
 const USAGE_URL = "https://chatgpt.com/backend-api/wham/usage";
@@ -100,6 +101,18 @@ type ProviderHint = {
   modelID?: string;
 };
 
+type CodexAccount = {
+  accountId?: string;
+  accessToken?: string;
+  enabled?: boolean;
+};
+
+type CodexAccountStorage = {
+  accounts?: CodexAccount[];
+  activeIndex?: number;
+  activeIndexByFamily?: Record<string, number>;
+};
+
 type CopilotQuotaSnapshot = {
   percent_remaining?: number;
   remaining?: number;
@@ -165,6 +178,7 @@ type UsageState =
       status: "ready";
       provider: ActiveProvider;
       planType?: string;
+      accountEmail?: string;
       primary?: WindowSnapshot;
       secondary?: WindowSnapshot;
       copilot?: {
@@ -206,25 +220,70 @@ function decodeBase64Url(value: string): string {
   return Buffer.from(padded, "base64").toString("utf8");
 }
 
-function readOpenAIAuth(): { access: string; accountId: string } {
+function decodeJwtPayload(access: string): Record<string, unknown> | undefined {
+  const tokenParts = String(access).split(".");
+  if (tokenParts.length < 2) return undefined;
+  return JSON.parse(decodeBase64Url(tokenParts[1]));
+}
+
+function extractChatGptAccountId(access: string): string | undefined {
+  const payload = decodeJwtPayload(access);
+  const auth = payload?.["https://api.openai.com/auth"] as Record<string, unknown> | undefined;
+  return typeof auth?.chatgpt_account_id === "string" ? auth.chatgpt_account_id : undefined;
+}
+
+function extractJwtEmail(access: string): string | undefined {
+  const payload = decodeJwtPayload(access);
+  return typeof payload?.email === "string" ? payload.email : undefined;
+}
+
+function readCodexAccounts(): CodexAccountStorage | undefined {
+  if (!existsSync(CODEX_ACCOUNTS_PATH)) return undefined;
+  const raw = JSON.parse(readFileSync(CODEX_ACCOUNTS_PATH, "utf8"));
+  if (!Array.isArray(raw?.accounts)) return undefined;
+  return raw as CodexAccountStorage;
+}
+
+function hasGlobalCodexAccounts(): boolean {
+  try {
+    const storage = readCodexAccounts();
+    return Boolean(storage?.accounts?.some((account) => account?.enabled !== false && account?.accessToken));
+  } catch {
+    return false;
+  }
+}
+
+function readCodexOpenAIAuth(): { access: string; accountId: string; email?: string } | undefined {
+  const storage = readCodexAccounts();
+  const accounts = storage?.accounts ?? [];
+  if (accounts.length === 0) return undefined;
+  const rawIndex = storage?.activeIndexByFamily?.codex ?? storage?.activeIndex ?? 0;
+  const activeIndex = Number.isFinite(rawIndex) ? Math.max(0, Math.min(accounts.length - 1, Math.trunc(rawIndex))) : 0;
+  const activeAccount = accounts[activeIndex];
+  const account = activeAccount?.enabled !== false ? activeAccount : accounts.find((candidate) => candidate?.enabled !== false);
+  const access = account?.accessToken;
+  if (!access) return undefined;
+  const accountId = account.accountId ?? extractChatGptAccountId(access);
+  if (!accountId) return undefined;
+  return { access, accountId, email: extractJwtEmail(access) };
+}
+
+function readOpenAIAuth(): { access: string; accountId: string; email?: string } {
+  const codexAuth = readCodexOpenAIAuth();
+  if (codexAuth) return codexAuth;
+
   const raw = JSON.parse(readFileSync(AUTH_PATH, "utf8"));
   const openai = raw?.openai;
   if (!openai?.access) {
     throw new Error("OpenAI auth not found");
   }
 
-  const tokenParts = String(openai.access).split(".");
-  if (tokenParts.length < 2) {
-    throw new Error("Invalid OpenAI access token");
-  }
-
-  const payload = JSON.parse(decodeBase64Url(tokenParts[1]));
-  const accountId = payload?.["https://api.openai.com/auth"]?.chatgpt_account_id;
+  const accountId = extractChatGptAccountId(openai.access);
   if (!accountId) {
     throw new Error("ChatGPT account id not found in token");
   }
 
-  return { access: openai.access, accountId };
+  return { access: openai.access, accountId, email: extractJwtEmail(openai.access) };
 }
 
 function readCopilotAuth(): { access: string } {
@@ -306,6 +365,7 @@ async function fetchOpenAIUsage(): Promise<Exclude<UsageState, { status: "loadin
     status: "ready",
     provider: "openai",
     planType: payload.plan_type,
+    accountEmail: auth.email,
     primary: payload.rate_limit?.primary_window,
     secondary: payload.rate_limit?.secondary_window,
     updatedAt: Date.now(),
@@ -513,6 +573,14 @@ async function fetchZenUsage(
 function formatPlan(planType?: string): string | undefined {
   if (!planType) return undefined;
   return planType.charAt(0).toUpperCase() + planType.slice(1);
+}
+
+function formatOpenAIAccount(planType?: string, email?: string): string | undefined {
+  const plan = formatPlan(planType);
+  const trimmedEmail = email?.trim();
+  if (trimmedEmail && plan) return `[${trimmedEmail} ${plan}]`;
+  if (trimmedEmail) return `[${trimmedEmail}]`;
+  return plan ? `[${plan}]` : undefined;
 }
 
 function formatAbsoluteReset(resetAt?: number): string | undefined {
@@ -916,9 +984,10 @@ function shouldShowUsageForSession(
     ? currentProviderHint(api, sessionID, sessionEntrySelectedHint, sessionSelectionChanged)
     : currentHomeProviderHint(api, homeEntryProviderHint, homeEntrySelectedHint, homeSelectionChanged);
   if (current.providerID || current.modelID) {
+    if (isOpenAIUsageProvider(current.providerID, current.modelID) && hasGlobalCodexAccounts()) return false;
     return isSupportedUsageProvider(current.providerID, current.modelID);
   }
-  return true;
+  return !hasGlobalCodexAccounts();
 }
 
 function currentSessionID(api: TuiPluginApi): string | undefined {
@@ -932,19 +1001,42 @@ function stateMatchesResolution(
   resolution: ProviderResolution | undefined,
   key: string,
 ): boolean {
-  return state.status === "ready" && !!resolution && resolution.key === key && state.provider === resolution.provider;
+  if (!resolution || resolution.key !== key) return false;
+  if (state.status === "ready") return state.provider === resolution.provider;
+  if (state.status === "error") return true;
+  return false;
+}
+
+function providerLabel(provider: ActiveProvider | undefined): string | undefined {
+  switch (provider) {
+    case "openai":
+      return "OpenAI";
+    case "copilot":
+      return "Copilot";
+    case "anthropic":
+      return "Anthropic";
+    case "zen":
+      return "Zen";
+    default:
+      return undefined;
+  }
 }
 
 function UsageBadge(props: {
   state: UsageState;
   theme: TuiThemeCurrent;
   compact?: boolean;
+  provider?: ActiveProvider;
 }) {
+  const label = providerLabel(props.provider);
+  const errorPrefix = label ? `[${label}] ` : "";
   return (
     <Show
       when={props.state.status === "ready"}
       fallback={
-        props.state.status === "error" ? <text fg={props.theme.textMuted}>Usage unavailable</text> : null
+        props.state.status === "error" ? (
+          <text fg={props.theme.textMuted}>{`${errorPrefix}Usage unavailable`}</text>
+        ) : null
       }
     >
       {(() => {
@@ -992,7 +1084,8 @@ function UsageBadge(props: {
           const output = formatMoney(ready.zen?.price?.output);
           const cost = formatMoney(ready.zen?.session?.cost);
           const tokens = formatCompactNumber(ready.zen?.session?.tokens);
-          const session = props.compact ? "" : ` | sess: ${cost}/${tokens}t`;
+          const approximate = ready.zen?.session?.approximate ? "~" : "";
+          const session = props.compact ? "" : ` | sess: ${approximate}${cost}/${tokens}t`;
           return (
             <box flexDirection="column">
               <text>{`[Zen] ${input}/${output} per M${session}`}</text>
@@ -1003,27 +1096,29 @@ function UsageBadge(props: {
           );
         }
 
-        const plan = formatPlan(ready.planType);
+        const account = formatOpenAIAccount(ready.planType, ready.accountEmail);
         const primaryLabel = formatWindowLabel(ready.primary, "5h");
         const secondaryLabel = formatWindowLabel(ready.secondary, "7d");
         const primaryUsed = ready.primary?.used_percent;
         const secondaryUsed = ready.secondary?.used_percent;
         const primaryReset = formatReset(ready.primary);
         const secondaryReset = formatReset(ready.secondary);
-        const planPrefix = plan ? `[${plan}] ` : "";
         return (
           <box flexDirection="row">
-            <text fg={props.theme.textMuted}>{planPrefix}</text>
+            <Show when={account}>
+              <text fg={props.theme.success}>{account}</text>
+              <text fg={props.theme.textMuted}>{" · "}</text>
+            </Show>
             <text fg={usageColor(props.theme, primaryUsed)}>
-              {typeof primaryUsed === "number" ? `${primaryLabel}: ${primaryUsed}%` : `${primaryLabel}: --`}
+              {typeof primaryUsed === "number" ? `${primaryLabel} ${primaryUsed}%` : `${primaryLabel} --`}
             </text>
             <Show when={!props.compact && primaryReset}>
               <text fg={props.theme.textMuted}>{` (-${primaryReset})`}</text>
             </Show>
             <Show when={typeof secondaryUsed === "number"}>
-              <text fg={props.theme.textMuted}>{" | "}</text>
+              <text fg={props.theme.textMuted}>{" · "}</text>
               <text fg={usageColor(props.theme, secondaryUsed)}>
-                {`${secondaryLabel}: ${secondaryUsed}%`}
+                {`${secondaryLabel} ${secondaryUsed}%`}
               </text>
             </Show>
             <Show when={!props.compact && typeof secondaryUsed === "number" && secondaryReset}>
@@ -1304,7 +1399,7 @@ function createRefreshLoop(api: TuiPluginApi) {
           return null;
         if (!stateMatchesResolution(state(), resolution(), providerResolutionKey(providerFromHint(hint), hint, sessionID)))
           return null;
-        return <UsageBadge state={state()} theme={ctx.theme.current} compact />;
+        return <UsageBadge state={state()} theme={ctx.theme.current} compact provider={resolution()?.provider} />;
       },
       session_prompt_right(ctx: TuiSlotContext & { session_id?: string }) {
         visibilityNonce();
@@ -1324,7 +1419,7 @@ function createRefreshLoop(api: TuiPluginApi) {
           return null;
         if (!stateMatchesResolution(state(), resolution(), providerResolutionKey(providerFromHint(hint), hint, sessionID)))
           return null;
-        return <UsageBadge state={state()} theme={ctx.theme.current} />;
+        return <UsageBadge state={state()} theme={ctx.theme.current} provider={resolution()?.provider} />;
       },
     },
   });
