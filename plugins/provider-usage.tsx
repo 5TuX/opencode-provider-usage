@@ -117,9 +117,16 @@ type CodexAccountStorage = {
 };
 
 type CodexQuotaSnapshot = {
+  type?: string;
+  accountIndex?: number;
+  accountCount?: number;
   accountEmail?: string;
   accountLabel?: string;
   planType?: string;
+  activeLimit?: number;
+  source?: string;
+  fetchedAt?: number;
+  stale?: boolean;
   limits?: Array<{
     label?: string;
     leftPercent?: number | null;
@@ -274,6 +281,16 @@ function hasGlobalCodexAccounts(): boolean {
   } catch {
     return false;
   }
+}
+
+function hasCodexMultiauthRuntime(api: TuiPluginApi): boolean {
+  try {
+    if (api.plugins.list().some((plugin) => plugin.id === "oc-codex-multi-auth")) return true;
+  } catch {
+    // Fall through to filesystem state checks.
+  }
+
+  return existsSync(CODEX_ACCOUNTS_PATH) || existsSync(CODEX_TUI_QUOTA_PATH);
 }
 
 function readCodexQuotaSnapshot(): CodexQuotaSnapshot | undefined {
@@ -669,20 +686,6 @@ function formatOpenAIAccount(planType?: string, accountIndex?: number, accountCo
   return `[${plan}] `;
 }
 
-function formatCodexQuotaDetails(snapshot?: CodexQuotaSnapshot): string {
-  if (!snapshot?.limits?.length) return "Quota details unavailable. Run a Codex request first or open codex-limits.";
-  const lines: string[] = [];
-  const account = snapshot.accountLabel?.trim();
-  if (account) lines.push(`Account: ${account.trim()}`);
-  for (const limit of snapshot.limits) {
-    if (!limit?.label) continue;
-    const used = typeof limit.usedPercent === "number" ? `${limit.usedPercent}% used` : "-- used";
-    const reset = formatAbsoluteReset(limit.resetAtMs);
-    lines.push(`${limit.label}: ${used}${reset ? ` (${reset})` : ""}`);
-  }
-  return lines.join("\n");
-}
-
 function formatOpenAIPrefix(state: Extract<UsageState, { status: "ready" }>): string | undefined {
   return formatOpenAIAccount(state.planType, state.accountIndex, state.accountCount);
 }
@@ -707,6 +710,60 @@ function formatCountdown(resetAt?: number): string | undefined {
   if (days > 0) return hours > 0 ? `${days}d${hours}h` : `${days}d`;
   if (hours > 0) return minutes > 0 ? `${hours}h${minutes}m` : `${hours}h`;
   return seconds > 0 ? `${minutes}m${seconds}s` : `${minutes}m`;
+}
+
+function formatCodexQuotaDetails(snapshot?: CodexQuotaSnapshot): string {
+  if (!snapshot) return "Codex quota is unavailable. Run a Codex-backed request first, then retry.";
+  if (snapshot.type === "missing") return "No Codex OAuth account is configured.";
+  if (snapshot.type === "unavailable") return "Codex quota is unavailable.";
+
+  const lines: string[] = [];
+  const account = snapshot.accountLabel ?? snapshot.accountEmail;
+  if (account) lines.push(`Account: ${account}`);
+  if (typeof snapshot.accountIndex === "number" && typeof snapshot.accountCount === "number") {
+    lines.push(`Account slot: ${snapshot.accountIndex}/${snapshot.accountCount}`);
+  }
+
+  for (const limit of snapshot.limits ?? []) {
+    const label = limit.label?.trim() || "quota";
+    const left = typeof limit.leftPercent === "number" ? `${limit.leftPercent}% left` : "unavailable";
+    const reset = formatAbsoluteReset(limit.resetAtMs);
+    lines.push(reset ? `${label}: ${left}, resets ${reset}` : `${label}: ${left}`);
+  }
+
+  if (snapshot.planType) lines.push(`Plan: ${snapshot.planType}`);
+  if (typeof snapshot.activeLimit === "number" && Number.isFinite(snapshot.activeLimit)) {
+    lines.push(`Active limit: ${snapshot.activeLimit}`);
+  }
+  if (snapshot.source) lines.push(`Source: ${snapshot.source === "headers" ? "response headers" : "usage endpoint"}`);
+  if (typeof snapshot.fetchedAt === "number" && Number.isFinite(snapshot.fetchedAt)) {
+    lines.push(`Updated: ${formatCountdown(snapshot.fetchedAt + 60_000) ?? "just now"}`);
+  }
+  if (snapshot.stale) lines.push("Status: stale fallback");
+
+  return lines.length > 0 ? lines.join("\n") : "Codex quota is unavailable.";
+}
+
+function registerCodexMultiauthWrapper(api: TuiPluginApi): () => void {
+  if (!api.command || !hasCodexMultiauthRuntime(api)) return () => {};
+
+  return api.command.register(() => [
+    {
+      title: "Codex quota details",
+      value: "provider-usage.codex.quota.details",
+      description: "Show Codex multi-auth quota details without rendering the multi-auth prompt badge.",
+      category: "Codex",
+      onSelect: () => {
+        api.ui.dialog.replace(() =>
+          api.ui.DialogAlert({
+            title: "Codex quota",
+            message: formatCodexQuotaDetails(readCodexQuotaSnapshot()),
+            onConfirm: () => api.ui.dialog.clear(),
+          }),
+        );
+      },
+    },
+  ]);
 }
 
 function formatWindowLabel(window?: WindowSnapshot, fallback?: string): string {
@@ -1468,25 +1525,9 @@ function createRefreshLoop(api: TuiPluginApi) {
   };
 
   void refresh();
+  const disposeCodexMultiauthWrapper = registerCodexMultiauthWrapper(api);
   const interval = setInterval(() => void refresh(), REFRESH_MS);
   const visibilityInterval = setInterval(syncVisibility, VISIBILITY_REFRESH_MS);
-
-  const commandDispose = api.command.register(() => [
-    {
-      title: "Codex quota details",
-      value: "codex.quota.details.local",
-      description: "Show active Codex quota details from the shared local cache.",
-      category: "Codex",
-      onSelect: () =>
-        api.ui.dialog.replace(() =>
-          api.ui.DialogAlert({
-            title: "Codex quota",
-            message: formatCodexQuotaDetails(readCodexQuotaSnapshot()),
-            onConfirm: () => api.ui.dialog.clear(),
-          }),
-        ),
-    },
-  ]);
 
   const offTuiCommand = api.event.on("tui.command.execute", syncVisibility);
   const offSessionSelect = api.event.on("tui.session.select", syncVisibility);
@@ -1552,7 +1593,7 @@ function createRefreshLoop(api: TuiPluginApi) {
     offMessageUpdated();
     offMessagePartDelta();
     offMessagePartUpdated();
-    commandDispose();
+    disposeCodexMultiauthWrapper();
   });
 }
 
